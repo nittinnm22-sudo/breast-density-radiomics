@@ -4899,7 +4899,9 @@ class ShapeFeatures:
         vox_cc = _bd_voxel_volume_cc(voxel_spacing_mm)
         volume_cc = float(np.count_nonzero(parenchymal_mask)) * vox_cc
         try:
-            spacing_xyz = (voxel_spacing_mm[2], voxel_spacing_mm[1], voxel_spacing_mm[0])
+            # voxel_spacing_mm is (z,y,x); marching_cubes expects (row,col,depth) = (z,y,x) spacing
+            z_sp, y_sp, x_sp = voxel_spacing_mm
+            spacing_xyz = (z_sp, y_sp, x_sp)
             verts, faces, _, _ = _bd_marching_cubes(parenchymal_mask.astype(np.float32), level=0.5, spacing=spacing_xyz)
             surface_mm2 = float(_bd_mesh_surface_area(verts, faces))
             volume_mm3 = volume_cc * 1000.0
@@ -5100,7 +5102,10 @@ class GLSZMFeatures(_BDTextureFeatureBase):
         glszm = np.zeros((n_g, max_zone), dtype=np.float64)
         for comp_idx in range(1, n_comp + 1):
             comp = labeled == comp_idx
-            gray = int(q_masked[comp][0]) if comp.any() and q_masked[comp].size > 0 else 0
+            vals = q_masked[comp]
+            vals = vals[vals >= 0]  # exclude out-of-mask sentinels
+            # Use modal gray level — a zone may span a few quantized values; take the most common one
+            gray = int(np.bincount(vals.astype(np.intp), minlength=n_g).argmax()) if vals.size > 0 else 0
             zone_size = int(np.count_nonzero(comp)) - 1
             if 0 <= gray < n_g and 0 <= zone_size < max_zone:
                 glszm[gray, zone_size] += 1
@@ -5135,9 +5140,9 @@ class GLDMFeatures(_BDTextureFeatureBase):
             g = int(q[z, y, x])
             dep = 0
             for dz, dy, dx in [(0, 0, 1), (0, 1, 0), (1, 0, 0), (0, 0, -1), (0, -1, 0), (-1, 0, 0)]:
-                nz, ny, nx2 = z + dz, y + dy, x + dx
-                if 0 <= nz < q.shape[0] and 0 <= ny < q.shape[1] and 0 <= nx2 < q.shape[2]:
-                    if parenchymal_mask[nz, ny, nx2] and q[nz, ny, nx2] == g:
+                nz, ny, n_x = z + dz, y + dy, x + dx
+                if 0 <= nz < q.shape[0] and 0 <= ny < q.shape[1] and 0 <= n_x < q.shape[2]:
+                    if parenchymal_mask[nz, ny, n_x] and q[nz, ny, n_x] == g:
                         dep += 1
             max_dep = max(max_dep, dep)
             dep_counts[(g, dep)] = dep_counts.get((g, dep), 0) + 1
@@ -5177,10 +5182,10 @@ class NGTDMFeatures(_BDTextureFeatureBase):
             g = int(q[z, y, x])
             neighbors = []
             for dz, dy, dx in [(0, 0, 1), (0, 0, -1), (0, 1, 0), (0, -1, 0), (1, 0, 0), (-1, 0, 0)]:
-                nz, ny, nx2 = z + dz, y + dy, x + dx
-                if 0 <= nz < q.shape[0] and 0 <= ny < q.shape[1] and 0 <= nx2 < q.shape[2]:
-                    if parenchymal_mask[nz, ny, nx2]:
-                        neighbors.append(float(q[nz, ny, nx2]))
+                nz, ny, n_x = z + dz, y + dy, x + dx
+                if 0 <= nz < q.shape[0] and 0 <= ny < q.shape[1] and 0 <= n_x < q.shape[2]:
+                    if parenchymal_mask[nz, ny, n_x]:
+                        neighbors.append(float(q[nz, ny, n_x]))
             if neighbors:
                 n_i[g] += 1
                 s_i[g] += abs(float(g) - np.mean(neighbors))
