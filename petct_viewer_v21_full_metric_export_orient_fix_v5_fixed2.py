@@ -54,3 +54,22 @@ plt.title('Receiver Operating Characteristic')
 plt.legend(loc='lower right')
 plt.savefig('roc_curve.png')
 plt.show() 
+
+# ============================================================
+# BREAST DENSITY MODULE — integration patch (additive only)
+# ============================================================
+try:
+    from breast_density_module import BreastDensityDialog as _BDD, _install_breast_density_toolbar as _ibd_tb
+
+    _v21_orig_build_for_bd = PETCTManualROIApp._build_ui
+
+    def _build_ui_with_breast_density(self, *a, **k):
+        _v21_orig_build_for_bd(self, *a, **k)
+        try:
+            _ibd_tb(self)
+        except Exception as _bd_e:
+            print(f"[BreastDensity] toolbar install failed: {_bd_e}")
+
+    PETCTManualROIApp._build_ui = _build_ui_with_breast_density
+except ImportError:
+    pass  # breast_density_module.py not present — skip silently
