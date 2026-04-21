@@ -8,18 +8,30 @@ regions, and computation of shape/intensity/texture complexity radiomics.
 Usage:
     - Import `BreastCTDensityEngine` and `ParenchymalComplexityEngine` for
       programmatic analysis.
-    - Use `V21BreastDensityTab` in Clinical Tools for interactive review/export.
-    - Run ML only via tab buttons after CSV export.
+    - Launch `BreastDensityDialog` for interactive review and export.
+    - Run this script directly to execute density and complexity ML analyses.
 """
 
 from __future__ import annotations
 
-import csv
 import os
+from datetime import datetime
 from typing import Dict, List, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
-from PyQt6 import QtCore, QtGui, QtWidgets
+import pandas as pd
+from scipy import ndimage as ndi
+from scipy.stats import entropy as scipy_entropy
+from scipy.stats import kurtosis, skew
+from skimage.measure import marching_cubes, mesh_surface_area
+from skimage.morphology import binary_closing, binary_opening, remove_small_objects
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import auc, roc_curve
+from sklearn.model_selection import train_test_split
+from sklearn.svm import SVC
+from sklearn.tree import DecisionTreeClassifier
 
 # ═══ SECTION 0 — Constants ═══
 HU_FAT_MAX = -25
@@ -57,35 +69,9 @@ try:
     import SimpleITK as sitk
     from radiomics import featureextractor
 
-    RADIOMICS_AVAILABLE = True
+    PYRADIOMICS_AVAILABLE = True
 except Exception:
-    RADIOMICS_AVAILABLE = False
-
-# --- Optional breast density dependencies (safe) ---
-try:
-    from scipy import ndimage as ndi
-    from scipy.stats import entropy as scipy_entropy
-    from scipy.stats import kurtosis, skew
-    from skimage.measure import marching_cubes, mesh_surface_area
-    from skimage.morphology import binary_closing, binary_opening, remove_small_objects
-    BREAST_DENSITY_DEPS_AVAILABLE = True
-except Exception:
-    BREAST_DENSITY_DEPS_AVAILABLE = False
-
-try:
-    from sklearn.ensemble import RandomForestClassifier
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.metrics import auc, roc_curve
-    from sklearn.model_selection import train_test_split
-    from sklearn.svm import SVC
-    from sklearn.tree import DecisionTreeClassifier
-    import pandas as pd
-    import matplotlib
-    matplotlib.use('Agg')  # non-interactive backend safe for PyQt6
-    import matplotlib.pyplot as plt
-    BREAST_ML_DEPS_AVAILABLE = True
-except Exception:
-    BREAST_ML_DEPS_AVAILABLE = False
+    PYRADIOMICS_AVAILABLE = False
 
 
 def _safe_div(numerator: float, denominator: float) -> float:
@@ -113,9 +99,6 @@ class BreastSegmentor:
 
     def segment_whole_breast(self, ct_volume: np.ndarray) -> Dict[str, np.ndarray]:
         """Segment right and left whole-breast masks using HU thresholding and morphology."""
-        if not BREAST_DENSITY_DEPS_AVAILABLE:
-            empty = np.zeros_like(ct_volume, dtype=bool)
-            return {"right_mask": empty, "left_mask": empty}
         breast = (ct_volume >= HU_BREAST_MIN) & (ct_volume <= HU_BREAST_MAX)
         breast = binary_closing(breast, footprint=np.ones((3, 3, 3)))
         breast = remove_small_objects(breast, min_size=2_000)
@@ -130,8 +113,6 @@ class BreastSegmentor:
 
     def segment_fibroglandular(self, ct_volume: np.ndarray, breast_mask: np.ndarray) -> np.ndarray:
         """Segment fibroglandular tissue within a provided whole-breast mask."""
-        if not BREAST_DENSITY_DEPS_AVAILABLE:
-            return np.zeros_like(ct_volume, dtype=bool)
         fg = (ct_volume > HU_FAT_MAX) & breast_mask
         fg = binary_opening(fg, footprint=np.ones((3, 3, 3)))
         fg = binary_closing(fg, footprint=np.ones((3, 3, 3)))
@@ -139,8 +120,6 @@ class BreastSegmentor:
 
     def exclude_non_parenchymal(self, fg_mask: np.ndarray, ct_volume: np.ndarray) -> np.ndarray:
         """Exclude skin, pectoralis, clips, and tumor-like components from fibroglandular mask."""
-        if not BREAST_DENSITY_DEPS_AVAILABLE:
-            return fg_mask.astype(bool)
         cleaned = fg_mask.copy()
         if not cleaned.any():
             print("[Segmentor] excluded 0 voxels: skin shell")
@@ -200,8 +179,6 @@ class BreastCTDensityEngine:
         self, ct_volume: np.ndarray, voxel_spacing_mm: Tuple[float, float, float] = (1.0, 1.0, 1.0)
     ) -> Dict[str, float]:
         """Compute right/left/bilateral volumetric density and asymmetry metrics."""
-        if not BREAST_DENSITY_DEPS_AVAILABLE:
-            return {}
         masks = self.segmentor.segment_whole_breast(ct_volume)
         voxel_cc = _voxel_volume_cc(voxel_spacing_mm)
 
@@ -325,7 +302,7 @@ class _TextureFeatureBase:
 
     @staticmethod
     def _pyradiomics_features(ct_volume: np.ndarray, mask: np.ndarray, feature_class: str, names: Dict[str, str]) -> Dict[str, float]:
-        if not RADIOMICS_AVAILABLE:
+        if not PYRADIOMICS_AVAILABLE:
             return {}
         try:
             image = sitk.GetImageFromArray(ct_volume.astype(np.float32))
@@ -669,8 +646,6 @@ class ParenchymalComplexityEngine:
 
     def compute_all(self) -> Dict[str, Dict[str, float] | float]:
         """Compute full complexity feature set and 21-feature manuscript shortlist."""
-        if not BREAST_DENSITY_DEPS_AVAILABLE:
-            return {"manuscript_shortlist": {k: 0.0 for k in MANUSCRIPT_SHORTLIST_FEATURES}}
         shape_features = ShapeFeatures().compute(self.parenchymal_mask, self.voxel_spacing_mm)
         first_order = FirstOrderFeatures().compute(self.ct_volume, self.parenchymal_mask)
         glcm = GLCMFeatures().compute(self.ct_volume, self.parenchymal_mask)
@@ -688,7 +663,119 @@ class ParenchymalComplexityEngine:
         return all_features
 
 
-def _train_classifiers(df: "pd.DataFrame", feature_columns: List[str], target_col: str):
+# ═══ SECTION 3 — GUI Workstation Dialog ═══
+class BreastDensityDialog:
+    """Tkinter dialog for density metrics, complexity features, and segmentation preview."""
+
+    def __init__(
+        self,
+        master,
+        ct_volume: np.ndarray,
+        voxel_spacing_mm: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+    ) -> None:
+        """Create dialog, run segmentation/feature engines, and render tabs."""
+        import tkinter as tk
+        from tkinter import ttk
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+        self._ttk = ttk
+        self.ct_volume = ct_volume
+        self.window = tk.Toplevel(master)
+        self.window.title("Breast CT Density + Parenchymal Complexity")
+        self.window.geometry("1100x800")
+
+        segmentor = BreastSegmentor()
+        self.whole_masks = segmentor.segment_whole_breast(ct_volume)
+        bilateral_fg = (
+            segmentor.segment_fibroglandular(ct_volume, self.whole_masks["right_mask"]) |
+            segmentor.segment_fibroglandular(ct_volume, self.whole_masks["left_mask"])
+        )
+        self.cleaned_parenchymal_mask = segmentor.exclude_non_parenchymal(bilateral_fg, ct_volume)
+
+        self.density_results = BreastCTDensityEngine().compute_volumetric_density(ct_volume, voxel_spacing_mm)
+        self.complexity_results = ParenchymalComplexityEngine(
+            ct_volume,
+            self.cleaned_parenchymal_mask,
+            voxel_spacing_mm,
+        ).compute_all()
+
+        notebook = ttk.Notebook(self.window)
+        tab_density = ttk.Frame(notebook)
+        tab_complexity = ttk.Frame(notebook)
+        tab_preview = ttk.Frame(notebook)
+        notebook.add(tab_density, text="Density")
+        notebook.add(tab_complexity, text="Complexity")
+        notebook.add(tab_preview, text="Segmentation Preview")
+        notebook.pack(fill="both", expand=True, padx=8, pady=8)
+
+        self._build_kv_table(tab_density, self.density_results)
+        self._build_kv_table(tab_complexity, self.complexity_results["manuscript_shortlist"])
+
+        fig = self._build_segmentation_figure()
+        canvas = FigureCanvasTkAgg(fig, master=tab_preview)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        button_frame = ttk.Frame(self.window)
+        button_frame.pack(fill="x", padx=8, pady=8)
+        ttk.Button(button_frame, text="Export Full Report", command=self.export_full_report).pack(side="left", padx=4)
+        ttk.Button(button_frame, text="Export Manuscript Panel", command=self.export_manuscript_panel).pack(side="left", padx=4)
+
+    def _build_kv_table(self, parent, values: Dict[str, float]) -> None:
+        """Render key/value table in the provided Tkinter parent frame."""
+        columns = ("metric", "value")
+        tree = self._ttk.Treeview(parent, columns=columns, show="headings")
+        tree.heading("metric", text="Metric")
+        tree.heading("value", text="Value")
+        tree.column("metric", width=420, anchor="w")
+        tree.column("value", width=220, anchor="e")
+        for key, value in values.items():
+            if key == "manuscript_shortlist":
+                continue
+            tree.insert("", "end", values=(key, f"{float(value):.6f}"))
+        tree.pack(fill="both", expand=True, padx=8, pady=8)
+
+    def _build_segmentation_figure(self):
+        """Build matplotlib figure with axial CT slice and segmentation overlays."""
+        mid = self.ct_volume.shape[0] // 2
+        ct_slice = self.ct_volume[mid]
+        whole = (self.whole_masks["right_mask"] | self.whole_masks["left_mask"])[mid]
+        fg = self.cleaned_parenchymal_mask[mid]
+
+        fig, ax = plt.subplots(figsize=(8, 6))
+        ax.imshow(ct_slice, cmap="gray")
+        whole_overlay = np.zeros((*whole.shape, 4), dtype=np.float32)
+        whole_overlay[..., 1] = whole.astype(np.float32)
+        whole_overlay[..., 3] = whole.astype(np.float32) * 0.25
+        fg_overlay = np.zeros((*fg.shape, 4), dtype=np.float32)
+        fg_overlay[..., 0] = fg.astype(np.float32)
+        fg_overlay[..., 3] = fg.astype(np.float32) * 0.35
+        ax.imshow(whole_overlay)
+        ax.imshow(fg_overlay)
+        ax.set_title("Axial Mid-Slice: Whole Breast (green) + Parenchyma (red)")
+        ax.axis("off")
+        fig.tight_layout()
+        return fig
+
+    def export_full_report(self) -> str:
+        """Export all density and complexity features to a timestamped CSV file."""
+        payload = {**self.density_results, **{k: v for k, v in self.complexity_results.items() if k != "manuscript_shortlist"}}
+        output = f"breast_full_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        pd.DataFrame([payload]).to_csv(output, index=False)
+        print(f"[Export] Full report saved: {output}")
+        return output
+
+    def export_manuscript_panel(self) -> str:
+        """Export only 21-feature manuscript shortlist to a timestamped CSV file."""
+        output = f"breast_manuscript_panel_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        pd.DataFrame([self.complexity_results["manuscript_shortlist"]]).to_csv(output, index=False)
+        print(f"[Export] Manuscript panel saved: {output}")
+        return output
+
+
+# ═══ SECTION 4 — ML Analysis ═══
+def _train_classifiers(df: pd.DataFrame, feature_columns: List[str], target_col: str):
+    """Train 4 baseline classifiers and return AUCs with ROC coordinates."""
     X = df[feature_columns]
     y = df[target_col]
     X_train, X_test, y_train, y_test = train_test_split(
@@ -715,9 +802,8 @@ def _train_classifiers(df: "pd.DataFrame", feature_columns: List[str], target_co
     return auc_results, curves
 
 
-def run_breast_density_ml_analysis(csv_path: str) -> Dict[str, float]:
-    if not BREAST_ML_DEPS_AVAILABLE:
-        raise RuntimeError("Breast ML dependencies are not available.")
+def run_breast_density_ml_analysis(csv_path: str = "breast_density_data.csv") -> Dict[str, float]:
+    """Train baseline ML models on density-oriented tabular features and save ROC plot."""
     df = pd.read_csv(csv_path)
     if "diagnosis" not in df.columns:
         raise ValueError("CSV must include 'diagnosis' column.")
@@ -732,14 +818,13 @@ def run_breast_density_ml_analysis(csv_path: str) -> Dict[str, float]:
     plt.title("ROC Curve — Breast Density Features")
     plt.legend(loc="lower right")
     plt.tight_layout()
-    plt.savefig(os.path.join(os.path.dirname(os.path.abspath(csv_path)), "roc_curve_density.png"), dpi=150)
+    plt.savefig("roc_curve.png", dpi=150)
     plt.close()
     return auc_results
 
 
-def run_complexity_ml_analysis(csv_path: str) -> Dict[str, float]:
-    if not BREAST_ML_DEPS_AVAILABLE:
-        raise RuntimeError("Breast ML dependencies are not available.")
+def run_complexity_ml_analysis(csv_path: str = "breast_density_data.csv") -> Dict[str, float]:
+    """Train baseline ML models on manuscript-shortlist complexity features and save ROC plot."""
     df = pd.read_csv(csv_path)
     if "diagnosis" not in df.columns:
         raise ValueError("CSV must include 'diagnosis' column.")
@@ -757,286 +842,19 @@ def run_complexity_ml_analysis(csv_path: str) -> Dict[str, float]:
     plt.title("ROC Curve — Parenchymal Complexity Features")
     plt.legend(loc="lower right")
     plt.tight_layout()
-    plt.savefig(os.path.join(os.path.dirname(os.path.abspath(csv_path)), "roc_curve_complexity.png"), dpi=150)
+    plt.savefig("roc_curve_complexity.png", dpi=150)
     plt.close()
     return auc_results
 
 
-# ═══ SECTION 3 — Qt Breast Density Tab + Clinical Tools ═══
-class V21BreastDensityTab(QtWidgets.QWidget):
-    def __init__(self, app) -> None:
-        super().__init__()
-        self.app = app
-        self._density_results: Dict[str, float] = {}
-        self._complexity_results: Dict[str, float] = {}
-
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.addWidget(QtWidgets.QLabel("Breast CT Density + Parenchymal Complexity Analysis"))
-
-        seg_box = QtWidgets.QGroupBox("Segmentation & Density")
-        seg_layout = QtWidgets.QVBoxLayout(seg_box)
-        ct_row = QtWidgets.QHBoxLayout()
-        ct_row.addWidget(QtWidgets.QLabel("CT source:"))
-        self.ct_source_label = QtWidgets.QLabel("Loaded CT" if self.app.ct_hu is not None else "No CT loaded")
-        ct_row.addWidget(self.ct_source_label)
-        ct_row.addStretch(1)
-        seg_layout.addLayout(ct_row)
-
-        btn_row = QtWidgets.QHBoxLayout()
-        btn_density = QtWidgets.QPushButton("Segment & Compute Density")
-        btn_complexity = QtWidgets.QPushButton("Segment & Compute Complexity")
-        btn_density.clicked.connect(self._compute_density)
-        btn_complexity.clicked.connect(self._compute_complexity)
-        btn_row.addWidget(btn_density)
-        btn_row.addWidget(btn_complexity)
-        seg_layout.addLayout(btn_row)
-        layout.addWidget(seg_box)
-
-        density_box = QtWidgets.QGroupBox("Density Results")
-        density_layout = QtWidgets.QVBoxLayout(density_box)
-        self.density_table = QtWidgets.QTableWidget(0, 2)
-        self.density_table.setHorizontalHeaderLabels(["Metric", "Value"])
-        self.density_table.horizontalHeader().setStretchLastSection(True)
-        density_layout.addWidget(self.density_table)
-        export_density = QtWidgets.QPushButton("Export Density CSV")
-        export_density.clicked.connect(self._export_density_csv)
-        density_layout.addWidget(export_density)
-        layout.addWidget(density_box)
-
-        complexity_box = QtWidgets.QGroupBox("Complexity Results (Manuscript 21 Features)")
-        complexity_layout = QtWidgets.QVBoxLayout(complexity_box)
-        self.complexity_table = QtWidgets.QTableWidget(0, 2)
-        self.complexity_table.setHorizontalHeaderLabels(["Metric", "Value"])
-        self.complexity_table.horizontalHeader().setStretchLastSection(True)
-        complexity_layout.addWidget(self.complexity_table)
-        export_complexity = QtWidgets.QPushButton("Export Complexity CSV")
-        export_complexity.clicked.connect(self._export_complexity_csv)
-        complexity_layout.addWidget(export_complexity)
-        layout.addWidget(complexity_box)
-
-        ml_box = QtWidgets.QGroupBox("ML Analysis (requires exported CSV with 'diagnosis' column)")
-        ml_layout = QtWidgets.QVBoxLayout(ml_box)
-        csv_row = QtWidgets.QHBoxLayout()
-        self.csv_path_edit = QtWidgets.QLineEdit()
-        self.csv_path_edit.setPlaceholderText("Export a CSV first, add a 'diagnosis' column (0/1), then run ML")
-        browse_btn = QtWidgets.QPushButton("Browse")
-        browse_btn.clicked.connect(self._browse_csv)
-        csv_row.addWidget(self.csv_path_edit)
-        csv_row.addWidget(browse_btn)
-        ml_layout.addLayout(csv_row)
-
-        run_row = QtWidgets.QHBoxLayout()
-        run_density = QtWidgets.QPushButton("Run Density ML")
-        run_complexity = QtWidgets.QPushButton("Run Complexity ML")
-        run_density.clicked.connect(self._run_density_ml)
-        run_complexity.clicked.connect(self._run_complexity_ml)
-        run_row.addWidget(run_density)
-        run_row.addWidget(run_complexity)
-        ml_layout.addLayout(run_row)
-
-        self.ml_label = QtWidgets.QLabel("Export a CSV first, add a 'diagnosis' column (0/1), then run ML")
-        ml_layout.addWidget(self.ml_label)
-        layout.addWidget(ml_box)
-
-        self.log = QtWidgets.QTextEdit()
-        self.log.setReadOnly(True)
-        self.log.setFixedHeight(80)
-        layout.addWidget(self.log)
-
-    def _status(self, msg: str) -> None:
-        self.log.append(msg)
-
-    def _set_table(self, table: QtWidgets.QTableWidget, values: Dict[str, float]) -> None:
-        table.setRowCount(len(values))
-        for row, (metric, value) in enumerate(values.items()):
-            table.setItem(row, 0, QtWidgets.QTableWidgetItem(str(metric)))
-            table.setItem(row, 1, QtWidgets.QTableWidgetItem(f"{float(value):.6f}"))
-
-    def _compute_density(self) -> None:
-        self.ct_source_label.setText("Loaded CT" if self.app.ct_hu is not None else "No CT loaded")
-        if self.app.ct_hu is None:
-            QtWidgets.QMessageBox.warning(self, "Breast Density", "No CT loaded.")
-            return
-        if not BREAST_DENSITY_DEPS_AVAILABLE:
-            QtWidgets.QMessageBox.warning(self, "Breast Density", "Optional breast density dependencies are unavailable.")
-            return
-        try:
-            self._density_results = BreastCTDensityEngine().compute_volumetric_density(self.app.ct_hu, self.app.spacing_zyx)
-            self._set_table(self.density_table, self._density_results)
-            self._status("Density computation complete.")
-        except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, "Density Error", str(exc))
-
-    def _compute_complexity(self) -> None:
-        self.ct_source_label.setText("Loaded CT" if self.app.ct_hu is not None else "No CT loaded")
-        if self.app.ct_hu is None:
-            QtWidgets.QMessageBox.warning(self, "Breast Complexity", "No CT loaded.")
-            return
-        if not BREAST_DENSITY_DEPS_AVAILABLE:
-            QtWidgets.QMessageBox.warning(self, "Breast Complexity", "Optional breast density dependencies are unavailable.")
-            return
-        try:
-            segmentor = BreastSegmentor()
-            masks = segmentor.segment_whole_breast(self.app.ct_hu)
-            bilateral_fg = (
-                segmentor.segment_fibroglandular(self.app.ct_hu, masks["right_mask"])
-                | segmentor.segment_fibroglandular(self.app.ct_hu, masks["left_mask"])
-            )
-            cleaned = segmentor.exclude_non_parenchymal(bilateral_fg, self.app.ct_hu)
-            full = ParenchymalComplexityEngine(self.app.ct_hu, cleaned, self.app.spacing_zyx).compute_all()
-            self._complexity_results = dict(full.get("manuscript_shortlist", {}))
-            self._set_table(self.complexity_table, self._complexity_results)
-            self._status("Complexity computation complete.")
-        except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, "Complexity Error", str(exc))
-
-    def _export_density_csv(self) -> None:
-        if not self._density_results:
-            QtWidgets.QMessageBox.warning(self, "Export", "No density results to export.")
-            return
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save Density CSV", "", "CSV Files (*.csv)")
-        if not path:
-            return
-        try:
-            with open(path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow(list(self._density_results.keys()))
-                writer.writerow([self._density_results[k] for k in self._density_results.keys()])
-            self._status(f"Saved density CSV: {path}")
-        except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, "Export Error", str(exc))
-
-    def _export_complexity_csv(self) -> None:
-        if not self._complexity_results:
-            QtWidgets.QMessageBox.warning(self, "Export", "No complexity results to export.")
-            return
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save Complexity CSV", "", "CSV Files (*.csv)")
-        if not path:
-            return
-        try:
-            with open(path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow(list(self._complexity_results.keys()))
-                writer.writerow([self._complexity_results[k] for k in self._complexity_results.keys()])
-            self._status(f"Saved complexity CSV: {path}")
-        except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, "Export Error", str(exc))
-
-    def _browse_csv(self) -> None:
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select ML CSV", "", "CSV Files (*.csv)")
-        if path:
-            self.csv_path_edit.setText(path)
-
-    def _run_density_ml(self) -> None:
-        path = self.csv_path_edit.text().strip()
-        if not path:
-            QtWidgets.QMessageBox.warning(self, "Density ML", "Please select a CSV path first.")
-            return
-        try:
-            results = run_breast_density_ml_analysis(path)
-            self.ml_label.setText("Density ML AUCs: " + ", ".join(f"{k}={v:.3f}" for k, v in results.items()))
-        except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, "Density ML Error", str(exc))
-
-    def _run_complexity_ml(self) -> None:
-        path = self.csv_path_edit.text().strip()
-        if not path:
-            QtWidgets.QMessageBox.warning(self, "Complexity ML", "Please select a CSV path first.")
-            return
-        try:
-            results = run_complexity_ml_analysis(path)
-            self.ml_label.setText("Complexity ML AUCs: " + ", ".join(f"{k}={v:.3f}" for k, v in results.items()))
-        except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, "Complexity ML Error", str(exc))
-
-
-class V21ClinicalToolsDialog(QtWidgets.QDialog):
-    def __init__(self, app) -> None:
-        super().__init__(app)
-        self.setWindowTitle("Clinical Tools")
-        self.resize(1100, 800)
-        self.tabs = QtWidgets.QTabWidget()
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.addWidget(self.tabs)
-
-
-def _v21_install_clinical_dialog_and_menu(app) -> None:
-    def _get_dialog():
-        if getattr(app, "_clinical_dialog", None) is None:
-            dlg = V21ClinicalToolsDialog(app)
-            tabs = dlg.tabs
-            tabs.addTab(QtWidgets.QWidget(), "Scan Info")
-            tabs.addTab(QtWidgets.QWidget(), "PERCIST")
-            tabs.addTab(QtWidgets.QWidget(), "RECIST 1.1")
-            tabs.addTab(QtWidgets.QWidget(), "Display")
-            tabs.addTab(QtWidgets.QWidget(), "Export")
-            tabs.addTab(QtWidgets.QWidget(), "3D Metrics")
-            tabs.addTab(QtWidgets.QWidget(), "NHOC/NHOP")
-            dlg.breast_tab = V21BreastDensityTab(app)
-            tabs.addTab(dlg.breast_tab, "Breast Density")
-            app._clinical_dialog = dlg
-        return app._clinical_dialog
-
-    def _show_dialog(tab_name="Breast Density"):
-        dlg = _get_dialog()
-        for i in range(dlg.tabs.count()):
-            if dlg.tabs.tabText(i) == tab_name:
-                dlg.tabs.setCurrentIndex(i)
-                break
-        dlg.show()
-        dlg.raise_()
-        dlg.activateWindow()
-
-    menu = QtWidgets.QMenu(app)
-    menu.addAction("Breast Density", lambda: _show_dialog("Breast Density"))
-    tool_button = QtWidgets.QToolButton()
-    tool_button.setText("Clinical Tools")
-    tool_button.setMenu(menu)
-    tool_button.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
-    app.toolbar.addWidget(tool_button)
-
-    clin_menu = app.menuBar().addMenu("Clinical Tools")
-    clin_menu.addAction("Breast Density", lambda: _show_dialog("Breast Density"))
-
-
-class PETCTViewerMainWindow(QtWidgets.QMainWindow):
-    def __init__(self) -> None:
-        super().__init__()
-        self.setWindowTitle("PET/CT Viewer v21")
-        self.resize(1280, 900)
-        self.ct_hu = None
-        self.spacing_zyx = (1.0, 1.0, 1.0)
-        self._clinical_dialog = None
-
-        self.toolbar = QtWidgets.QToolBar("Main")
-        self.addToolBar(QtCore.Qt.ToolBarArea.TopToolBarArea, self.toolbar)
-        load_demo = QtGui.QAction("Load Demo CT", self)
-        load_demo.triggered.connect(self._load_demo_ct)
-        self.toolbar.addAction(load_demo)
-
-        label = QtWidgets.QLabel("PET/CT Viewer workspace")
-        label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.setCentralWidget(label)
-        _v21_install_clinical_dialog_and_menu(self)
-
-    def _load_demo_ct(self) -> None:
-        z, y, x = np.indices((64, 160, 160))
-        c = np.array([32, 80, 80])
-        r = np.sqrt((z - c[0]) ** 2 + (y - c[1]) ** 2 + (x - c[2]) ** 2)
-        vol = np.full((64, 160, 160), -900.0, dtype=np.float32)
-        vol[r < 60] = -80
-        vol[r < 40] = 10
-        self.ct_hu = vol
-        self.spacing_zyx = (1.0, 1.0, 1.0)
-        QtWidgets.QMessageBox.information(self, "Demo", "Synthetic CT loaded.")
-
-
-def main() -> None:
-    app = QtWidgets.QApplication([])
-    win = PETCTViewerMainWindow()
-    win.show()
-    app.exec()
-
-
+# ═══ SECTION 5 — Main Entry ═══
 if __name__ == "__main__":
-    main()
+    """Run density and complexity ML analyses when executed as a script."""
+    csv = "breast_density_data.csv"
+    if os.path.exists(csv):
+        print("Running breast density ML analysis...")
+        print(run_breast_density_ml_analysis(csv))
+        print("Running parenchymal complexity ML analysis...")
+        print(run_complexity_ml_analysis(csv))
+    else:
+        print(f"Skipping ML analysis: {csv} not found.")
