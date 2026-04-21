@@ -204,7 +204,8 @@ if tk is not None:
             try:
                 array = self._read_image_as_array(file_path)
             except Exception as exc:
-                messagebox.showerror("Load Error", f"Could not load image:\n{exc}")
+                print(f"[ERROR] Could not load image '{file_path}': {exc}")
+                messagebox.showerror("Load Error", "Could not load image. Please verify the file format and dependencies.")
                 return
 
             self.current_image_array = array
@@ -217,7 +218,7 @@ if tk is not None:
             if lower.endswith(".npy"):
                 return np.load(file_path)
 
-            if sitk is not None and (lower.endswith(".nii") or lower.endswith(".nii.gz") or lower.endswith(".mha") or lower.endswith(".mhd")):
+            if sitk is not None and lower.endswith((".nii", ".nii.gz", ".mha", ".mhd")):
                 image = sitk.ReadImage(file_path)
                 arr = sitk.GetArrayFromImage(image)
                 return arr[0] if arr.ndim >= 3 else arr
@@ -277,18 +278,53 @@ else:
 # ML / ROC Analysis Module
 # ==============================
 def run_breast_density_ml_analysis(csv_path="breast_density_data.csv"):
-    if not os.path.exists(csv_path):
+    try:
+        data = pd.read_csv(csv_path)
+    except FileNotFoundError:
         print(f"[WARN] CSV not found: {csv_path}. Skipping ML ROC analysis.")
         return {}
 
-    data = pd.read_csv(csv_path)
+    if data.empty:
+        print("[WARN] CSV is empty. Skipping ML ROC analysis.")
+        return {}
+
     if "diagnosis" not in data.columns:
         print("[WARN] CSV missing required 'diagnosis' column. Skipping ML ROC analysis.")
         return {}
 
-    X = data.drop("diagnosis", axis=1)
     y = data["diagnosis"]
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    X = data.drop("diagnosis", axis=1).select_dtypes(include=[np.number])
+    valid_mask = y.notna()
+    X = X.loc[valid_mask].dropna()
+    y = y.loc[X.index]
+
+    if X.empty or y.empty:
+        print("[WARN] No valid numeric features/labels available after cleaning. Skipping ML ROC analysis.")
+        return {}
+
+    if y.nunique() < 2:
+        print("[WARN] Need at least two diagnosis classes for ROC analysis. Skipping.")
+        return {}
+
+    if y.value_counts().min() < 2:
+        print("[WARN] Need at least two samples per diagnosis class for train/test split. Skipping.")
+        return {}
+
+    if len(X) < 5:
+        print("[WARN] Not enough samples for train/test split. Skipping ML ROC analysis.")
+        return {}
+
+    try:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=y
+        )
+    except ValueError as exc:
+        print(f"[WARN] Could not split dataset for ROC analysis: {exc}")
+        return {}
+
+    if y_test.nunique() < 2:
+        print("[WARN] Test split has fewer than two classes; ROC analysis skipped.")
+        return {}
 
     classifiers = {
         "Logistic Regression": LogisticRegression(max_iter=1000),
@@ -325,7 +361,7 @@ def run_breast_density_ml_analysis(csv_path="breast_density_data.csv"):
 # Main Entry Point
 # ==============================
 if __name__ == "__main__":
-    threading.Thread(target=run_breast_density_ml_analysis, daemon=True).start()
+    run_breast_density_ml_analysis()
 
     if tk is None:
         print("[ERROR] tkinter is not installed. GUI workstation cannot start.")
