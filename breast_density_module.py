@@ -655,8 +655,8 @@ class BreastDensityDialog(QDialog):
         # First-order
         out[f"{prefix}_MeanHU"] = {"R": None, "L": None, "B": float(np.mean(ct_vals))}
         out[f"{prefix}_SDHU"] = {"R": None, "L": None, "B": float(np.std(ct_vals))}
-        out[f"{prefix}_Skewness"] = {"R": None, "L": None, "B": float(skew(ct_vals)) if skew else float(0.0)}
-        out[f"{prefix}_Kurtosis"] = {"R": None, "L": None, "B": float(kurtosis(ct_vals)) if kurtosis else float(0.0)}
+        out[f"{prefix}_Skewness"] = {"R": None, "L": None, "B": float(skew(ct_vals)) if skew else float("nan")}
+        out[f"{prefix}_Kurtosis"] = {"R": None, "L": None, "B": float(kurtosis(ct_vals)) if kurtosis else float("nan")}
         p10, p90 = np.percentile(ct_vals, [10, 90])
         out[f"{prefix}_IQR_P10_P90"] = {"R": None, "L": None, "B": float(p90 - p10)}
 
@@ -769,7 +769,7 @@ class BreastDensityDialog(QDialog):
         else:
             vals = patch.ravel().astype(np.float64)
             contrast = float(np.var(vals))
-            corr = float(np.corrcoef(vals[:-1], vals[1:])[0, 1]) if vals.size > 2 else 0.0
+            corr = float("nan")
             energy = float(np.mean(vals ** 2))
             hom = float(1.0 / (1.0 + np.var(vals)))
             p = np.bincount(vals.astype(int), minlength=32).astype(np.float64)
@@ -833,8 +833,9 @@ class BreastDensityDialog(QDialog):
         fat_r = self.pet_suv[self.fat_r] if np.any(self.fat_r) else np.array([0.0])
         fat_l = self.pet_suv[self.fat_l] if np.any(self.fat_l) else np.array([0.0])
 
-        out["SUV_mean_FGT"] = {"R": float(np.mean(fgt_r)), "L": float(np.mean(fgt_l)), "B": float(np.mean(np.r_[fgt_r, fgt_l]))}
-        out["SUV_max_FGT"] = {"R": float(np.max(fgt_r)), "L": float(np.max(fgt_l)), "B": float(np.max(np.r_[fgt_r, fgt_l]))}
+        fgt_b = np.r_[fgt_r, fgt_l]
+        out["SUV_mean_FGT"] = {"R": float(np.mean(fgt_r)), "L": float(np.mean(fgt_l)), "B": float(np.mean(fgt_b))}
+        out["SUV_max_FGT"] = {"R": float(np.max(fgt_r)), "L": float(np.max(fgt_l)), "B": float(np.max(fgt_b))}
 
         whole_r = np.r_[fgt_r, fat_r]
         whole_l = np.r_[fgt_l, fat_l]
@@ -889,10 +890,10 @@ class BreastDensityDialog(QDialog):
             "right_fat.nii.gz": self.fat_r,
             "left_fat.nii.gz": self.fat_l,
         }
-        affine = np.diag([self.spacing[2], self.spacing[1], self.spacing[0], 1.0])
+        affine = np.diag([self.spacing[0], self.spacing[1], self.spacing[2], 1.0])
         for name, m in masks.items():
             out_path = os.path.join(folder, name)
-            arr = m.astype(np.uint8)
+            arr = np.transpose(m.astype(np.uint8), (2, 1, 0))
             if _NIB_AVAILABLE:
                 img = nib.Nifti1Image(arr, affine=affine)
                 nib.save(img, out_path)
@@ -917,7 +918,7 @@ class BreastDensityDialog(QDialog):
         c.setFont("Helvetica", 10)
         c.drawString(40, y, f"Generated: {datetime.now().isoformat(timespec='seconds')}")
         y -= 20
-        c.drawString(40, y, f"CT shape: {None if self.ct is None else self.ct.shape}, spacing(mm): {self.spacing}")
+        c.drawString(40, y, f"CT shape: {'N/A' if self.ct is None else self.ct.shape}, spacing(mm): {self.spacing}")
         y -= 24
         c.setFont("Helvetica", 9)
         for metric, vals in self.results.items():
