@@ -2,7 +2,33 @@
 
 PET/CT viewer with CT breast 3D volumetric density, tissue complexity, and FDG uptake assessment module.
 
-## Files
+## Unified workstation
 
-- `petct_viewer_v21_full_metric_export_orient_fix_v5_fixed2.py` — main PET/CT viewer (v21)
-- `breast_density_module.py` — breast density & radiomics complexity module (to be added)
+Use the unified script:
+
+- `petct_breast_density_unified_workstation.py` — integrated PET/CT GUI workstation + breast density analyzer + ML ROC analysis
+
+## Dependencies
+
+Required:
+
+- `numpy`
+- `pandas`
+- `matplotlib`
+- `scikit-learn`
+
+Optional image I/O:
+
+- `Pillow`
+- `SimpleITK`
+
+## Run
+
+```bash
+python petct_breast_density_unified_workstation.py
+```
+
+Behavior:
+
+- Runs breast density ML ROC analysis from `breast_density_data.csv` if available (saves `roc_curve.png`)
+- Launches the unified PET/CT workstation with inlined breast density dialog and export tools
