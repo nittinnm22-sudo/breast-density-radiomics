@@ -5027,9 +5027,9 @@ class ShapeFeatures:
             svr = _bd_safe_div(surface_mm2, volume_mm3)
             sphericity = _bd_safe_div((np.pi ** (1.0 / 3.0)) * ((6.0 * volume_mm3) ** (2.0 / 3.0)), surface_mm2)
         except Exception:
-            svr = 0.0
-            sphericity = 0.0
-            surface_mm2 = 0.0
+            svr = float("nan")
+            sphericity = float("nan")
+            surface_mm2 = float("nan")
 
         try:
             coords = np.argwhere(parenchymal_mask)
@@ -5041,9 +5041,9 @@ class ShapeFeatures:
                 elongation = float(np.sqrt(_bd_safe_div(eigvals[1], eigvals[0])))
                 flatness = float(np.sqrt(_bd_safe_div(eigvals[2], eigvals[0])))
             else:
-                elongation = flatness = 0.0
+                elongation = flatness = float("nan")
         except Exception:
-            elongation = flatness = 0.0
+            elongation = flatness = float("nan")
 
         return {
             "volume_cc": round(volume_cc, 4),
@@ -5062,7 +5062,7 @@ class FirstOrderFeatures:
     def compute(self, ct_volume: np.ndarray, parenchymal_mask: np.ndarray) -> dict:
         voxels = ct_volume[parenchymal_mask].astype(np.float64)
         if len(voxels) == 0:
-            return {k: 0.0 for k in ["mean_hu", "median_hu", "std_hu", "min_hu", "max_hu",
+            return {k: float("nan") for k in ["mean_hu", "median_hu", "std_hu", "min_hu", "max_hu",
                                       "range_hu", "skewness", "kurtosis", "entropy", "uniformity",
                                       "energy", "p10_hu", "p90_hu", "iqr_hu"]}
         quantized = _bd_prepare_quantized_volume(ct_volume, parenchymal_mask)
@@ -5111,10 +5111,10 @@ class _BDTextureFeatureBase:
                     try:
                         out[out_key] = float(result[full])
                     except Exception:
-                        out[out_key] = 0.0
+                        out[out_key] = float("nan")
             return out
         except Exception:
-            return {v: 0.0 for v in names.values()}
+            return {v: float("nan") for v in names.values()}
 
 
 class GLCMFeatures(_BDTextureFeatureBase):
@@ -5150,11 +5150,32 @@ class GLCMFeatures(_BDTextureFeatureBase):
         std_j = float(np.sqrt(np.sum(glcm * (j_idx - mu_j) ** 2)))
         correlation = float(np.sum(glcm * (i_idx - mu_i) * (j_idx - mu_j))) / (std_i * std_j + 1e-12)
         joint_entropy = float(-np.sum(glcm * np.log2(glcm + 1e-12)))
+        joint_energy = float(np.sum(glcm ** 2))
+        homogeneity = float(np.sum(glcm / (1.0 + diff ** 2)))
+        cluster_shade = float(np.sum(glcm * ((i_idx + j_idx - mu_i - mu_j) ** 3)))
+        cluster_prominence = float(np.sum(glcm * ((i_idx + j_idx - mu_i - mu_j) ** 4)))
+        # sum/diff distributions
+        sum_idx = (i_idx + j_idx).astype(np.int32)
+        diff_idx = np.abs(diff).astype(np.int32)
+        p_xpy = np.zeros(2 * n, dtype=np.float64)
+        np.add.at(p_xpy, sum_idx.ravel(), glcm.ravel())
+        p_xmy = np.zeros(n, dtype=np.float64)
+        np.add.at(p_xmy, diff_idx.ravel(), glcm.ravel())
+        sum_entropy = float(-np.sum(p_xpy * np.log2(p_xpy + 1e-12)))
+        diff_variance = float(np.sum(np.arange(n, dtype=np.float64) ** 2 * p_xmy))
+        # MCC
+        p_x = glcm.sum(axis=1)
+        p_y = glcm.sum(axis=0)
+        p_x_s = np.where(p_x > 0, p_x, 1.0)
+        p_y_s = np.where(p_y > 0, p_y, 1.0)
+        q_mcc = (glcm / p_y_s[np.newaxis, :]) @ glcm.T / (p_x_s[:, np.newaxis] * p_x_s[np.newaxis, :])
+        ev = np.sort(np.real(np.linalg.eigvals(q_mcc)))[::-1]
+        mcc = float(np.sqrt(max(ev[1], 0.0))) if len(ev) > 1 else 0.0
         return {"glcm_contrast": round(contrast, 6), "glcm_correlation": round(correlation, 6),
-                "glcm_joint_entropy": round(joint_entropy, 6), "glcm_joint_energy": 0.0,
-                "glcm_homogeneity": 0.0, "glcm_cluster_shade": 0.0,
-                "glcm_cluster_prominence": 0.0, "glcm_mcc": 0.0,
-                "glcm_diff_variance": 0.0, "glcm_sum_entropy": 0.0}
+                "glcm_joint_entropy": round(joint_entropy, 6), "glcm_joint_energy": round(joint_energy, 6),
+                "glcm_homogeneity": round(homogeneity, 6), "glcm_cluster_shade": round(cluster_shade, 6),
+                "glcm_cluster_prominence": round(cluster_prominence, 6), "glcm_mcc": round(mcc, 6),
+                "glcm_diff_variance": round(diff_variance, 6), "glcm_sum_entropy": round(sum_entropy, 6)}
 
 
 class GLRLMFeatures(_BDTextureFeatureBase):
@@ -5208,10 +5229,17 @@ class GLRLMFeatures(_BDTextureFeatureBase):
         lre = float(np.sum(glrlm * (r_idx ** 2))) / total
         run_probs = glrlm / (glrlm.sum() + 1e-12)
         run_ent = float(-np.sum(run_probs * np.log2(run_probs + 1e-12)))
+        glnu = float(np.sum(glrlm.sum(axis=1) ** 2)) / total
+        rlnu = float(np.sum(glrlm.sum(axis=0) ** 2)) / total
+        total_vox = float(np.sum(glrlm * r_idx[np.newaxis, :]))
+        run_pct = _bd_safe_div(total, max(total_vox, 1.0))
+        g_idx_rl = np.arange(glrlm.shape[0], dtype=np.float64)
+        srhgle = float(np.sum(glrlm / (r_idx ** 2 + 1e-12) * (g_idx_rl[:, np.newaxis] ** 2))) / total
+        lrhgle = float(np.sum(glrlm * (r_idx ** 2) * (g_idx_rl[:, np.newaxis] ** 2))) / total
         return {"glrlm_short_run_emphasis": round(sre, 6), "glrlm_long_run_emphasis": round(lre, 6),
-                "glrlm_run_entropy": round(run_ent, 6), "glrlm_gl_non_uniformity": 0.0,
-                "glrlm_rl_non_uniformity": 0.0, "glrlm_run_percentage": 0.0,
-                "glrlm_srhgle": 0.0, "glrlm_lrhgle": 0.0}
+                "glrlm_run_entropy": round(run_ent, 6), "glrlm_gl_non_uniformity": round(glnu, 6),
+                "glrlm_rl_non_uniformity": round(rlnu, 6), "glrlm_run_percentage": round(run_pct, 6),
+                "glrlm_srhgle": round(srhgle, 6), "glrlm_lrhgle": round(lrhgle, 6)}
 
 
 class GLSZMFeatures(_BDTextureFeatureBase):
@@ -5254,9 +5282,16 @@ class GLSZMFeatures(_BDTextureFeatureBase):
         lae = float(np.sum(glszm * (z_idx ** 2))) / total
         zone_probs = glszm / (glszm.sum() + 1e-12)
         zone_ent = float(-np.sum(zone_probs * np.log2(zone_probs + 1e-12)))
+        glnu_sz = float(np.sum(glszm.sum(axis=1) ** 2)) / total
+        zsnu = float(np.sum(glszm.sum(axis=0) ** 2)) / total
+        total_vox_sz = float(np.sum(glszm * z_idx[np.newaxis, :]))
+        zone_pct = _bd_safe_div(total, max(total_vox_sz, 1.0))
+        g_idx_sz = np.arange(n_g, dtype=np.float64)
+        sahgle = float(np.sum(glszm / (z_idx ** 2 + 1e-12) * (g_idx_sz[:, np.newaxis] ** 2))) / total
         return {"glszm_zone_entropy": round(zone_ent, 6), "glszm_small_area_emphasis": round(sae, 6),
-                "glszm_large_area_emphasis": round(lae, 6), "glszm_gl_non_uniformity": 0.0,
-                "glszm_zone_size_non_uniformity": 0.0, "glszm_zone_percentage": 0.0, "glszm_sahgle": 0.0}
+                "glszm_large_area_emphasis": round(lae, 6), "glszm_gl_non_uniformity": round(glnu_sz, 6),
+                "glszm_zone_size_non_uniformity": round(zsnu, 6), "glszm_zone_percentage": round(zone_pct, 6),
+                "glszm_sahgle": round(sahgle, 6)}
 
 
 class GLDMFeatures(_BDTextureFeatureBase):
@@ -5284,7 +5319,7 @@ class GLDMFeatures(_BDTextureFeatureBase):
             shifted_m[tuple(sl)] = False
             dep_count += (parenchymal_mask & shifted_m & (q == shifted_q)).astype(np.int32)
         if not parenchymal_mask.any():
-            return {v: 0.0 for v in names.values()}
+            return {v: float("nan") for v in names.values()}
         grays = q[parenchymal_mask]
         deps = dep_count[parenchymal_mask]
         max_dep = int(deps.max()) + 1
@@ -5294,11 +5329,14 @@ class GLDMFeatures(_BDTextureFeatureBase):
         total = gldm.sum() + 1e-12
         dep_idx = np.arange(max_dep, dtype=np.float64)
         dnu = float(np.sum(gldm.sum(axis=0) ** 2)) / total
+        glnu_gldm = float(np.sum(gldm.sum(axis=1) ** 2)) / total
         dep_probs = gldm / (gldm.sum() + 1e-12)
         dep_ent = float(-np.sum(dep_probs * np.log2(dep_probs + 1e-12)))
+        sde = float(np.sum(dep_probs[:, 1:] / ((dep_idx[1:] ** 2) + 1e-12))) if max_dep > 1 else 0.0
+        lde = float(np.sum(dep_probs[:, 1:] * (dep_idx[1:] ** 2))) if max_dep > 1 else 0.0
         return {"gldm_dependence_non_uniformity": round(dnu, 6), "gldm_dependence_entropy": round(dep_ent, 6),
-                "gldm_small_dependence_emphasis": 0.0, "gldm_large_dependence_emphasis": 0.0,
-                "gldm_gl_non_uniformity": 0.0}
+                "gldm_small_dependence_emphasis": round(sde, 6), "gldm_large_dependence_emphasis": round(lde, 6),
+                "gldm_gl_non_uniformity": round(glnu_gldm, 6)}
 
 
 class NGTDMFeatures(_BDTextureFeatureBase):
@@ -5342,8 +5380,24 @@ class NGTDMFeatures(_BDTextureFeatureBase):
         busyness_num = float(np.sum(p_i * s_i))
         busyness_den = float(np.sum(np.abs(np.outer(p_i * g_idx, np.ones(n_g)) - np.outer(np.ones(n_g), p_i * g_idx))))
         busyness = _bd_safe_div(busyness_num, busyness_den)
+        # Contrast
+        pij = np.outer(p_i, p_i)
+        ii_m, jj_m = np.meshgrid(g_idx, g_idx, indexing="ij")
+        ng = max(float(np.count_nonzero(p_i)), 1.0)
+        contrast_num = float(np.sum(pij * (ii_m - jj_m) ** 2))
+        contrast = _bd_safe_div(contrast_num, ng * (ng - 1.0 + 1e-8)) * _bd_safe_div(float(np.sum(s_i)), float(total_n))
+        # Complexity
+        abs_diff_m = np.abs(ii_m - jj_m)
+        si_mat = s_i[:, None] * np.ones((1, n_g))
+        sj_mat = np.ones((n_g, 1)) * s_i[None, :]
+        p_sum_m = p_i[:, None] + p_i[None, :] + 1e-12
+        complexity = float(np.sum(pij * abs_diff_m * (p_i[:, None] * si_mat + p_i[None, :] * sj_mat) / p_sum_m))
+        # Strength
+        s_total = float(np.sum(s_i)) + 1e-12
+        strength = _bd_safe_div(float(np.sum(pij * (ii_m - jj_m) ** 2 * (p_i[:, None] + p_i[None, :]))), s_total)
         return {"ngtdm_coarseness": round(coarseness, 6), "ngtdm_busyness": round(busyness, 6),
-                "ngtdm_complexity": 0.0, "ngtdm_contrast": 0.0, "ngtdm_strength": 0.0}
+                "ngtdm_complexity": round(complexity, 6), "ngtdm_contrast": round(contrast, 6),
+                "ngtdm_strength": round(strength, 6)}
 
 
 # --- Parenchymal Complexity Engine ---
