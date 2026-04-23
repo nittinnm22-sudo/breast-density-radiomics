@@ -331,6 +331,13 @@ class GLCMFeatures(_TextureFeatureBase):
 
     def compute(self, ct_volume: np.ndarray, parenchymal_mask: np.ndarray) -> Dict[str, float]:
         """Compute contrast, correlation, joint entropy, and inverse difference."""
+        _glcm_nan = {k: float("nan") for k in [
+            "glcm_contrast", "glcm_correlation", "glcm_joint_entropy", "glcm_joint_energy",
+            "glcm_homogeneity", "glcm_inverse_difference", "glcm_cluster_shade",
+            "glcm_cluster_prominence", "glcm_mcc", "glcm_diff_variance", "glcm_sum_entropy",
+        ]}
+        if not np.any(parenchymal_mask):
+            return _glcm_nan
         pyr = self._pyradiomics_features(
             ct_volume,
             parenchymal_mask,
@@ -372,11 +379,45 @@ class GLCMFeatures(_TextureFeatureBase):
         sig_j = float(np.sqrt(np.sum(((jj - mu_j) ** 2) * p)))
         correlation = _safe_div(np.sum((ii - mu_i) * (jj - mu_j) * p), sig_i * sig_j)
 
+        # Marginal sums
+        p_x = p.sum(axis=1)   # shape (VOXEL_BINS,)
+        p_y = p.sum(axis=0)
+
+        # Sum distribution p(x+y): bin k = i+j, k in [0, 2*(N-1)]
+        sum_idx = (ii + jj).astype(np.int32)
+        p_xpy = np.zeros(2 * VOXEL_BINS, dtype=np.float64)
+        np.add.at(p_xpy, sum_idx.ravel(), p.ravel())
+
+        # Difference distribution p(|x-y|): bin k = |i-j|, k in [0, N-1]
+        diff_idx = np.abs(ii - jj).astype(np.int32)
+        p_xmy = np.zeros(VOXEL_BINS, dtype=np.float64)
+        np.add.at(p_xmy, diff_idx.ravel(), p.ravel())
+
+        sum_entropy = float(-np.sum(p_xpy * np.log2(p_xpy + 1e-12)))
+        k_diff = np.arange(VOXEL_BINS, dtype=np.float64)
+        diff_variance = float(np.sum(k_diff ** 2 * p_xmy))
+
+        # MCC (Maximal Correlation Coefficient): sqrt of 2nd-largest eigenvalue of Q
+        p_x_safe = np.where(p_x > 0, p_x, 1.0)
+        p_y_safe = np.where(p_y > 0, p_y, 1.0)
+        # Q[i,j] = sum_k( p(i,k)*p(j,k) / p_y(k) ) / (p_x(i)*p_x(j))
+        p_over_py = p / p_y_safe[np.newaxis, :]   # (N, N)
+        q_mcc = (p_over_py @ p.T) / (p_x_safe[:, np.newaxis] * p_x_safe[np.newaxis, :])
+        eigvals_mcc = np.sort(np.real(np.linalg.eigvals(q_mcc)))[::-1]
+        mcc = float(np.sqrt(max(eigvals_mcc[1], 0.0))) if len(eigvals_mcc) > 1 else 0.0
+
         return {
             "glcm_contrast": float(np.sum(((ii - jj) ** 2) * p)),
             "glcm_correlation": float(correlation),
             "glcm_joint_entropy": float(-np.sum(p * np.log2(p + 1e-12))),
+            "glcm_joint_energy": float(np.sum(p ** 2)),
+            "glcm_homogeneity": float(np.sum(p / (1.0 + (ii - jj) ** 2))),
             "glcm_inverse_difference": float(np.sum(p / (1.0 + np.abs(ii - jj)))),
+            "glcm_cluster_shade": float(np.sum(((ii + jj - mu_i - mu_j) ** 3) * p)),
+            "glcm_cluster_prominence": float(np.sum(((ii + jj - mu_i - mu_j) ** 4) * p)),
+            "glcm_mcc": mcc,
+            "glcm_diff_variance": diff_variance,
+            "glcm_sum_entropy": sum_entropy,
         }
 
 
@@ -421,6 +462,10 @@ class GLRLMFeatures(_TextureFeatureBase):
                 "glrlm_long_run_emphasis": float("nan"),
                 "glrlm_run_entropy": float("nan"),
                 "glrlm_gray_level_non_uniformity": float("nan"),
+                "glrlm_run_length_non_uniformity": float("nan"),
+                "glrlm_run_percentage": float("nan"),
+                "glrlm_short_run_high_gray_level_emphasis": float("nan"),
+                "glrlm_long_run_high_gray_level_emphasis": float("nan"),
             }
         rids_flat = run_id.ravel()
         grays_flat = q_2d.ravel()
@@ -440,11 +485,25 @@ class GLRLMFeatures(_TextureFeatureBase):
         lre = float(np.sum(p[:, 1:] * (run_lengths[1:] ** 2)))
         run_entropy = float(-np.sum(p[p > 0] * np.log2(p[p > 0])))
         glnu = float(np.sum(np.sum(rlm, axis=1) ** 2) / max(rlm.sum(), 1.0))
+        rlnu = float(np.sum(np.sum(rlm, axis=0) ** 2) / max(rlm.sum(), 1.0))
+        total_runs = float(rlm.sum())
+        total_voxels = float(np.sum(rlm * run_lengths[np.newaxis, :]))
+        run_pct = _safe_div(total_runs, max(total_voxels, 1.0))
+
+        gray_levels = np.arange(n_g, dtype=np.float64)
+        # SRHGLE = short-run high gray-level emphasis
+        srhgle = float(np.sum(p[:, 1:] * (gray_levels[:, np.newaxis] ** 2) / (run_lengths[1:] ** 2)))
+        # LRHGLE = long-run high gray-level emphasis
+        lrhgle = float(np.sum(p[:, 1:] * (gray_levels[:, np.newaxis] ** 2) * (run_lengths[1:] ** 2)))
         return {
             "glrlm_short_run_emphasis": sre,
             "glrlm_long_run_emphasis": lre,
             "glrlm_run_entropy": run_entropy,
             "glrlm_gray_level_non_uniformity": glnu,
+            "glrlm_run_length_non_uniformity": rlnu,
+            "glrlm_run_percentage": run_pct,
+            "glrlm_short_run_high_gray_level_emphasis": srhgle,
+            "glrlm_long_run_high_gray_level_emphasis": lrhgle,
         }
 
 
@@ -487,6 +546,9 @@ class GLSZMFeatures(_TextureFeatureBase):
                 "glszm_large_area_emphasis": float("nan"),
                 "glszm_zone_entropy": float("nan"),
                 "glszm_gray_level_non_uniformity": float("nan"),
+                "glszm_zone_size_non_uniformity": float("nan"),
+                "glszm_zone_percentage": float("nan"),
+                "glszm_small_area_high_gray_level_emphasis": float("nan"),
             }
 
         max_zone = int(max(zones_s))
@@ -497,15 +559,24 @@ class GLSZMFeatures(_TextureFeatureBase):
 
         p = szm / max(szm.sum(), 1.0)
         sizes = np.arange(p.shape[1], dtype=np.float64)
+        gray_levels_sz = np.arange(VOXEL_BINS, dtype=np.float64)
         sae = float(np.sum(p[:, 1:] / (sizes[1:] ** 2)))
         lae = float(np.sum(p[:, 1:] * (sizes[1:] ** 2)))
         zone_entropy = float(-np.sum(p[p > 0] * np.log2(p[p > 0])))
         glnu = float(np.sum(np.sum(szm, axis=1) ** 2) / max(szm.sum(), 1.0))
+        zsnu = float(np.sum(np.sum(szm, axis=0) ** 2) / max(szm.sum(), 1.0))
+        total_zones = float(szm.sum())
+        total_vox_sz = float(np.sum(szm * sizes[np.newaxis, :]))
+        zone_pct = _safe_div(total_zones, max(total_vox_sz, 1.0))
+        sahgle = float(np.sum(p[:, 1:] * (gray_levels_sz[:, np.newaxis] ** 2) / (sizes[1:] ** 2)))
         return {
             "glszm_small_area_emphasis": sae,
             "glszm_large_area_emphasis": lae,
             "glszm_zone_entropy": zone_entropy,
             "glszm_gray_level_non_uniformity": glnu,
+            "glszm_zone_size_non_uniformity": zsnu,
+            "glszm_zone_percentage": zone_pct,
+            "glszm_small_area_high_gray_level_emphasis": sahgle,
         }
 
 
@@ -649,7 +720,13 @@ class NGTDMFeatures(_TextureFeatureBase):
 
         total = float(np.sum(n_i))
         if total == 0:
-            return {"ngtdm_coarseness": float("nan"), "ngtdm_contrast": float("nan"), "ngtdm_busyness": float("nan")}
+            return {
+                "ngtdm_coarseness": float("nan"),
+                "ngtdm_contrast": float("nan"),
+                "ngtdm_busyness": float("nan"),
+                "ngtdm_complexity": float("nan"),
+                "ngtdm_strength": float("nan"),
+            }
 
         p_i = n_i / total
         coarseness = _safe_div(1.0, np.sum(p_i * s_i) + 1e-8)
@@ -664,10 +741,23 @@ class NGTDMFeatures(_TextureFeatureBase):
         busy_den = np.sum(np.abs(ii * p_i[:, None] - jj * p_i[None, :]))
         busyness = _safe_div(np.sum(p_i * s_i), busy_den)
 
+        # Complexity: sum over (i,j) of |i-j| * (p_i*s_i + p_j*s_j) / (p_i + p_j + eps)
+        abs_diff = np.abs(ii - jj)
+        si_mat = s_i[:, None] * np.ones((1, VOXEL_BINS))
+        sj_mat = np.ones((VOXEL_BINS, 1)) * s_i[None, :]
+        p_sum = p_i[:, None] + p_i[None, :] + 1e-12
+        complexity = float(np.sum(pij * abs_diff * (p_i[:, None] * si_mat + p_i[None, :] * sj_mat) / p_sum))
+
+        # Strength: sum of (p_i+p_j)*(i-j)^2 for all active pairs, divided by sum(s_i)+eps
+        s_total = float(np.sum(s_i)) + 1e-12
+        strength = _safe_div(float(np.sum(pij * (ii - jj) ** 2 * (p_i[:, None] + p_i[None, :]))), s_total)
+
         return {
             "ngtdm_coarseness": float(coarseness),
             "ngtdm_contrast": float(contrast),
             "ngtdm_busyness": float(busyness),
+            "ngtdm_complexity": float(complexity),
+            "ngtdm_strength": float(strength),
         }
 
 
