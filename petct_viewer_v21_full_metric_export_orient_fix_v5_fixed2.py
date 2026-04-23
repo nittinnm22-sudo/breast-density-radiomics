@@ -4840,6 +4840,20 @@ try:
 except Exception:
     BREAST_ML_DEPS_AVAILABLE = False
 
+# --- Optional TotalSegmentator integration ---
+# When installed, TotalSegmentator is used to derive precise anatomical
+# boundaries (diaphragm Z-plane from lung lobes, posterior Y-boundary from
+# thoracic vertebrae) that replace the HU-based heuristics.  The application
+# loads and runs normally without it.
+try:
+    from totalsegmentator.python_api import totalsegmentator as _bd_ts_api
+    import nibabel as _bd_nib
+    _BD_TS_AVAILABLE = True
+except Exception:
+    _BD_TS_AVAILABLE = False
+    _bd_ts_api = None   # type: ignore[assignment]
+    _bd_nib = None      # type: ignore[assignment]
+
 # --- Constants ---
 _BD_HU_FAT_MAX = -25
 _BD_HU_BREAST_MIN = -300
@@ -4998,6 +5012,136 @@ def _bd_get_body_outline(ct_volume: np.ndarray) -> np.ndarray:
     return body.astype(bool)
 
 
+# --- TotalSegmentator anatomy-constraint helpers ---
+
+# Structures used to locate the diaphragm (inferior boundary of lungs)
+_BD_TS_LUNG_STRUCTURES = [
+    "lung_upper_lobe_left",
+    "lung_lower_lobe_left",
+    "lung_upper_lobe_right",
+    "lung_middle_lobe_right",
+    "lung_lower_lobe_right",
+]
+
+# Thoracic vertebrae used to establish the posterior breast boundary
+_BD_TS_VERTEBRAE_STRUCTURES = [
+    "vertebrae_T1", "vertebrae_T2", "vertebrae_T3", "vertebrae_T4",
+    "vertebrae_T5", "vertebrae_T6", "vertebrae_T7", "vertebrae_T8",
+    "vertebrae_T9", "vertebrae_T10", "vertebrae_T11", "vertebrae_T12",
+]
+
+
+def _bd_sitk_to_nib(sitk_img: "sitk.Image") -> "_bd_nib.Nifti1Image":
+    """Convert a SimpleITK image to a nibabel Nifti1Image.
+
+    SimpleITK stores arrays as (Z, Y, X) in LPS physical coordinates.
+    NIfTI / nibabel uses (X, Y, Z) in RAS coordinates.  This function
+    transposes the data array and builds the correct RAS affine.
+    """
+    arr_zyx = sitk.GetArrayFromImage(sitk_img).astype(np.float32)  # (Z, Y, X)
+    arr_xyz = arr_zyx.transpose(2, 1, 0)                           # (X, Y, Z)
+
+    spacing = sitk_img.GetSpacing()     # (sx, sy, sz) mm  — ITK order
+    origin  = sitk_img.GetOrigin()      # (ox, oy, oz) LPS
+    direction = np.array(sitk_img.GetDirection()).reshape(3, 3)  # 3×3 LPS
+
+    # Build LPS affine: p_LPS = direction @ diag(spacing) @ index + origin
+    affine_lps = np.eye(4)
+    affine_lps[:3, :3] = direction @ np.diag(spacing)
+    affine_lps[:3, 3] = origin
+
+    # Convert LPS → RAS (flip X and Y sign)
+    lps_to_ras = np.diag([-1.0, -1.0, 1.0, 1.0])
+    affine_ras = lps_to_ras @ affine_lps
+
+    return _bd_nib.Nifti1Image(arr_xyz, affine_ras)
+
+
+def _bd_ts_anatomy_constraints(ct_sitk: "sitk.Image") -> dict:
+    """Run TotalSegmentator (lung lobes + thoracic vertebrae) and extract
+    anatomical boundaries for breast segmentation.
+
+    Uses ``roi_subset`` to request only the two structure groups so the run
+    is faster than a full 104-class inference.  The ``fast=True`` flag uses
+    the 3 mm low-resolution model which is sufficient for boundary detection.
+
+    Returns a dict with any subset of:
+
+    ``z_top``
+        Superior-most Z index (array coords) that contains lung signal.
+    ``z_diaphragm``
+        Inferior-most Z index with lung signal + 5-slice margin.
+    ``y_posterior_vertebrae``
+        Anterior face of the thoracic vertebrae (array Y-axis) minus a
+        5-voxel clearance margin.  Used as the posterior breast boundary.
+
+    Returns an empty dict if TotalSegmentator is unavailable, the model
+    weights are absent, or any other error occurs.  Callers fall back to
+    the HU-based heuristics automatically.
+    """
+    if not _BD_TS_AVAILABLE or ct_sitk is None:
+        return {}
+    try:
+        nib_img = _bd_sitk_to_nib(ct_sitk)
+        roi_subset = _BD_TS_LUNG_STRUCTURES + _BD_TS_VERTEBRAE_STRUCTURES
+        nz, ny, nx = sitk.GetArrayFromImage(ct_sitk).shape  # (Z, Y, X)
+
+        with tempfile.TemporaryDirectory(prefix="bd_ts_") as tmpdir:
+            out_dir = os.path.join(tmpdir, "segs")
+            _bd_ts_api(
+                nib_img, out_dir,
+                task="total",
+                roi_subset=roi_subset,
+                fast=True,          # 3 mm model — sufficient for boundary detection
+                verbose=False,
+                statistics=False,
+                radiomics=False,
+            )
+
+            def _load_mask(structures, shape_zyx):
+                mask = np.zeros(shape_zyx, dtype=bool)
+                for s in structures:
+                    p = os.path.join(out_dir, f"{s}.nii.gz")
+                    if os.path.exists(p):
+                        # nibabel data is (X, Y, Z); transpose to (Z, Y, X)
+                        seg_xyz = _bd_nib.load(p).get_fdata() > 0.5
+                        mask |= seg_xyz.transpose(2, 1, 0)
+                return mask
+
+            lung_mask = _load_mask(_BD_TS_LUNG_STRUCTURES, (nz, ny, nx))
+            vert_mask = _load_mask(_BD_TS_VERTEBRAE_STRUCTURES, (nz, ny, nx))
+
+        result: dict = {}
+
+        # --- Diaphragm from lung Z extent ---
+        lung_z = np.where(lung_mask.any(axis=(1, 2)))[0]
+        if lung_z.size >= 5:
+            result["z_top"] = int(lung_z[0])
+            result["z_diaphragm"] = min(int(lung_z[-1]) + 5, nz - 1)
+
+        # --- Posterior boundary from vertebrae Y extent ---
+        # In standard axial CT (supine, head-first) Y=0 is anterior and
+        # Y increases toward posterior, so the vertebrae occupy high Y indices.
+        # We use the minimum Y of the vertebral mask (its anterior face) as the
+        # posterior breast boundary, minus a 5-voxel clearance.
+        if vert_mask.any():
+            vert_y = np.where(vert_mask.any(axis=(0, 2)))[0]
+            if vert_y.size > 0:
+                vert_y_mean = float(vert_y.mean())
+                if vert_y_mean > ny / 2:
+                    # Vertebrae are in the posterior (high-Y) half — standard orientation
+                    y_boundary = max(1, int(vert_y.min()) - 5)
+                else:
+                    # Vertebrae are in the anterior (low-Y) half — flipped Y axis
+                    y_boundary = min(ny - 1, int(vert_y.max()) + 5)
+                result["y_posterior_vertebrae"] = y_boundary
+
+        return result
+
+    except Exception:
+        return {}
+
+
 # --- Segmentation ---
 class BreastSegmentor:
     """Performs whole-breast and fibroglandular segmentation on CT volumes.
@@ -5021,24 +5165,42 @@ class BreastSegmentor:
     # 0.55 means the anterior 55 % of AP depth; posterior 45 % is excluded.
     _ANTERIOR_FRACTION = 0.55
 
-    def _breast_roi_mask(self, ct_volume: np.ndarray) -> np.ndarray:
+    def _breast_roi_mask(self, ct_volume: np.ndarray,
+                         ct_sitk=None) -> np.ndarray:
         """Build a 3-D Boolean mask restricting analysis to the anterior thorax.
 
         Combines:
           * Z range  — thorax only (lungs detected; below diaphragm excluded)
           * Y range  — anterior fraction only (eliminates spine/posterior structures)
           * Body outline — exclude air / CT table
+
+        When TotalSegmentator is installed and ``ct_sitk`` is supplied the Z
+        and Y boundaries are derived from actual lung-lobe and thoracic-vertebra
+        segmentations, giving much more precise anatomical constraints than the
+        HU-based fall-backs.
         """
         nz, ny, nx = ct_volume.shape
 
-        # 1. Detect thorax Z range
-        try:
-            z_top, z_diaph = _bd_detect_thorax_z_range(ct_volume)
-        except Exception:
-            z_top, z_diaph = 0, nz // 2
+        # --- Try TotalSegmentator for precise anatomical boundaries first ---
+        ts = _bd_ts_anatomy_constraints(ct_sitk) if (_BD_TS_AVAILABLE and ct_sitk is not None) else {}
 
-        # 2. Anterior crop: keep only the anterior fraction of AP (Y) depth
-        y_end = max(1, int(ny * self._ANTERIOR_FRACTION))
+        # 1. Detect thorax Z range
+        if "z_top" in ts and "z_diaphragm" in ts:
+            z_top  = ts["z_top"]
+            z_diaph = ts["z_diaphragm"]
+            self._last_seg_backend = "TotalSegmentator"
+        else:
+            try:
+                z_top, z_diaph = _bd_detect_thorax_z_range(ct_volume)
+            except Exception:
+                z_top, z_diaph = 0, nz // 2
+            self._last_seg_backend = "HU-heuristic"
+
+        # 2. Posterior Y boundary (anterior breast limit)
+        if "y_posterior_vertebrae" in ts:
+            y_end = ts["y_posterior_vertebrae"]
+        else:
+            y_end = max(1, int(ny * self._ANTERIOR_FRACTION))
 
         # 3. Body outline to exclude air and table
         try:
@@ -5052,7 +5214,9 @@ class BreastSegmentor:
         roi &= body
         return roi
 
-    def segment_whole_breast(self, ct_volume: np.ndarray, roi_mask: np.ndarray = None) -> dict:
+    def segment_whole_breast(self, ct_volume: np.ndarray,
+                             roi_mask: np.ndarray = None,
+                             ct_sitk=None) -> dict:
         """Segment left and right whole-breast regions.
 
         Parameters
@@ -5062,6 +5226,10 @@ class BreastSegmentor:
         roi_mask:
             Optional pre-computed anterior-thorax ROI mask.  If not supplied it
             is computed automatically via ``_breast_roi_mask``.
+        ct_sitk:
+            Optional SimpleITK image of the same CT volume.  When supplied and
+            TotalSegmentator is installed, the ROI mask is derived from actual
+            anatomical segmentations rather than HU-based heuristics.
 
         Returns
         -------
@@ -5071,7 +5239,7 @@ class BreastSegmentor:
 
         # Step 1 — restrict to anterior thorax
         if roi_mask is None:
-            roi_mask = self._breast_roi_mask(ct_volume)
+            roi_mask = self._breast_roi_mask(ct_volume, ct_sitk=ct_sitk)
 
         # Step 2 — HU-based breast tissue candidate mask within the ROI
         breast_hu = (ct_volume >= _BD_HU_BREAST_MIN) & (ct_volume <= _BD_HU_BREAST_MAX)
@@ -5195,11 +5363,13 @@ class BreastCTDensityEngine:
     def __init__(self) -> None:
         self.segmentor = BreastSegmentor()
 
-    def compute_volumetric_density(self, ct_volume: np.ndarray, voxel_spacing_mm=(1.0, 1.0, 1.0)) -> dict:
+    def compute_volumetric_density(self, ct_volume: np.ndarray,
+                                   voxel_spacing_mm=(1.0, 1.0, 1.0),
+                                   ct_sitk=None) -> dict:
         vox_cc = _bd_voxel_volume_cc(voxel_spacing_mm)
+        whole_masks = self.segmentor.segment_whole_breast(ct_volume, ct_sitk=ct_sitk)
 
         def _side_metrics(side: str) -> dict:
-            whole_masks = self.segmentor.segment_whole_breast(ct_volume)
             breast_mask = whole_masks[f"{side}_mask"]
             fg_mask = self.segmentor.segment_fibroglandular(ct_volume, breast_mask)
             cleaned = self.segmentor.exclude_non_parenchymal(fg_mask, ct_volume)
@@ -6299,11 +6469,12 @@ class V21BreastDensityTab(QtWidgets.QWidget):
         spacing = getattr(self._app, "spacing_zyx", (1.0, 1.0, 1.0))
         voxel_spacing_mm = (float(spacing[0]), float(spacing[1]), float(spacing[2]))
         ct_snap = ct_hu.copy()
+        ct_sitk_ref = getattr(self._app, "ct_image", None)   # SimpleITK image for TS
         tumor_excl = self._roi_tumor_exclusion.copy() if self._roi_tumor_exclusion is not None else None
 
         def _compute():
             segmentor = BreastSegmentor()
-            whole_masks = segmentor.segment_whole_breast(ct_snap)
+            whole_masks = segmentor.segment_whole_breast(ct_snap, ct_sitk=ct_sitk_ref)
             vox_cc = float(np.prod(voxel_spacing_mm) / 1000.0)
             fg_masks: dict = {}
             results: dict = {}
@@ -6344,9 +6515,11 @@ class V21BreastDensityTab(QtWidgets.QWidget):
                         results["left_volumetric_density_pct"]), 3),
             })
             return {"results": results, "fg_masks": fg_masks, "whole_masks": whole_masks,
-                    "excl_detail": excl_detail}
+                    "excl_detail": excl_detail,
+                    "seg_backend": getattr(segmentor, "_last_seg_backend", "HU-heuristic")}
 
-        self._log_msg("[Density] Starting auto-segmentation …")
+        ts_note = " (TotalSegmentator)" if _BD_TS_AVAILABLE else " (HU-heuristic fallback — TotalSegmentator not installed)"
+        self._log_msg(f"[Density] Starting auto-segmentation{ts_note} …")
         self._set_busy(True, "Auto-segmenting whole breast + fibroglandular tissue … please wait")
         self._worker = _BreastWorker(_compute)
         self._worker.finished.connect(self._on_density_done)
@@ -6374,7 +6547,9 @@ class V21BreastDensityTab(QtWidgets.QWidget):
                           f"whole={results.get(f'{side}_whole_breast_vol_cc', 0.0):.1f} cc, "
                           f"FG={results.get(f'{side}_fibroglandular_vol_cc', 0.0):.1f} cc, "
                           f"density={results.get(f'{side}_volumetric_density_pct', 0.0):.1f}%")
-        self._log_msg("[Density] Done. Colour overlays: cyan=right whole, blue=left whole, "
+        backend = payload.get("seg_backend", "HU-heuristic")
+        self._log_msg(f"[Density] Done. Segmentation backend: {backend}. "
+                      "Colour overlays: cyan=right whole, blue=left whole, "
                       "orange=right FG, gold=left FG. "
                       "Skin, pectoralis and clips are excluded automatically.")
 
