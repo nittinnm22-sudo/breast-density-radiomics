@@ -1,0 +1,249 @@
+Use two parallel outputs in your pipeline:
+
+Breast density should be a custom volumetric CT module, not a PyRadiomics feature set.
+Breast complexity should be a prespecified PyRadiomics panel extracted from the 3D fibroglandular/parenchymal mask. PyRadiomics supports the feature classes firstorder, shape, glcm, glrlm, glszm, gldm, and ngtdm; by default, if you do not restrict features, it enables all available features, which is usually too broad for a 200-patient study. IBSI also recommends reporting modality, interpolation, re-segmentation, discretization, and aggregation choices explicitly.
+
+1) Exact features to calculate
+A. Density module
+
+These should be computed from your whole-breast mask and fibroglandular/parenchymal mask, not from PyRadiomics.
+
+Per breast and bilateral combined
+
+TotalBreastVolume_ml
+FibroglandularVolume_ml
+FatVolume_ml
+VolumetricDensity_pct = FibroglandularVolume / TotalBreastVolume × 100
+DensityAsymmetry_abs = |RightDensity - LeftDensity|
+DensityAsymmetry_rel = |RightDensity - LeftDensity| / mean(RightDensity, LeftDensity) × 100
+
+Good secondary density variables
+
+RightTotalBreastVolume_ml
+LeftTotalBreastVolume_ml
+RightFibroglandularVolume_ml
+LeftFibroglandularVolume_ml
+RightFatVolume_ml
+LeftFatVolume_ml
+
+This is the most defensible CT-density approach because chest CT has already been used to quantify percent breast density, not just visual “dense/non-dense” impressions.
+
+B. Complexity module
+
+Extract this from the 3D fibroglandular/parenchymal mask after excluding:
+
+primary tumor
+biopsy cavity/clip
+skin and nipple if separable
+pectoralis/intercostal muscle
+obvious vessels and non-breast soft tissue
+Recommended exact PyRadiomics feature list
+shape
+MeshVolume
+VoxelVolume
+SurfaceArea
+SurfaceVolumeRatio
+Sphericity
+Maximum3DDiameter
+MajorAxisLength
+MinorAxisLength
+LeastAxisLength
+Elongation
+Flatness
+
+PyRadiomics documents Sphericity, Maximum3DDiameter, Elongation, and Flatness as standard shape features.
+
+firstorder
+Mean
+Median
+10Percentile
+90Percentile
+InterquartileRange
+Variance
+Skewness
+Kurtosis
+Entropy
+Uniformity
+
+PyRadiomics defines first-order features as statistics describing the distribution of voxel intensities within the ROI, and notes that CT users should think carefully about voxelArrayShift; setting it to 0 keeps behavior closest to IBSI for first-order calculations.
+
+glcm
+JointEntropy
+Contrast
+Correlation
+DifferenceEntropy
+Idm
+Imc1
+glrlm
+RunEntropy
+GrayLevelNonUniformity
+RunLengthNonUniformity
+ShortRunEmphasis
+LongRunEmphasis
+glszm
+ZoneEntropy
+GrayLevelNonUniformity
+SizeZoneNonUniformity
+SmallAreaEmphasis
+LargeAreaEmphasis
+gldm
+DependenceEntropy
+DependenceNonUniformity
+SmallDependenceEmphasis
+LargeDependenceEmphasis
+GrayLevelNonUniformity
+ngtdm
+Coarseness
+Busyness
+Complexity
+Contrast
+Strength
+
+PyRadiomics exposes these matrix-based feature families, and IBSI provides the standard family names and reporting structure for GLCM, GLRLM, GLSZM, and neighboring/dependence matrices. PyRadiomics also explicitly documents NGTDM features such as Coarseness, Busyness, and Complexity.
+
+That gives you a focused 42-feature complexity panel plus the density block, which is much safer than dumping all features.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+“Both breasts were segmented in three dimensions on the contrast-enhanced CT component of baseline PET/CT. For each breast, a total breast volume mask and a fibroglandular/parenchymal mask were generated using synchronized multiplanar editing in axial, coronal, and sagittal views, yielding a single final 3D binary mask. Primary breast tumors, biopsy cavities or clips, pectoralis muscle, skin, and obvious extra-breast soft tissue were excluded from the parenchymal complexity mask. CT-derived volumetric breast density was calculated outside the radiomics engine as fibroglandular volume divided by total breast volume, expressed as a percentage. Absolute total breast volume, fibroglandular volume, fat volume, and right-left density asymmetry indices were also recorded.”
+
+“Radiomic features were extracted from the final 3D fibroglandular/parenchymal masks using an in-house software platform with an integrated PyRadiomics backend and a locked parameter file. The extracted feature classes were limited a priori to first-order, shape, gray-level co-occurrence matrix, gray-level run length matrix, gray-level size zone matrix, gray-level dependence matrix, and neighboring gray tone difference matrix features. To avoid overfitting and redundant reporting, a prespecified subset of morphologic and texture features was used to represent breast parenchymal complexity. Feature extraction and reporting were performed in an IBSI-aligned manner, with explicit documentation of interpolation, discretization, aggregation, and mask-processing settings.”
+
+3) Parameter-file template
+
+This is a practical starting template for your CT parenchymal complexity extraction. The parameter names and feature-class structure match PyRadiomics customization syntax  
+
+ImageType:
+  Original: {}
+
+setting:
+  label: 1
+  correctMask: true
+  geometryTolerance: 1e-6
+
+  # CT study recommendation
+  normalize: false
+  force2D: false
+
+  # Use isotropic resampling only if your pipeline is configured
+  # to do this consistently for every case.
+  resampledPixelSpacing: [1.2, 1.2, 1.2]
+  interpolator: 'sitkBSpline'
+  padDistance: 5
+
+  # Discretization
+  binWidth: 25
+
+  # Keep closest to IBSI behavior for CT first-order features
+  voxelArrayShift: 0
+
+  # Optional: leave off initially unless you formally decide on a
+  # reproducible tissue-specific range after pilot QC
+  # resegmentRange: [-200, 300]
+
+featureClass:
+  shape:
+    - MeshVolume
+    - VoxelVolume
+    - SurfaceArea
+    - SurfaceVolumeRatio
+    - Sphericity
+    - Maximum3DDiameter
+    - MajorAxisLength
+    - MinorAxisLength
+    - LeastAxisLength
+    - Elongation
+    - Flatness
+
+  firstorder:
+    - Mean
+    - Median
+    - 10Percentile
+    - 90Percentile
+    - InterquartileRange
+    - Variance
+    - Skewness
+    - Kurtosis
+    - Entropy
+    - Uniformity
+
+  glcm:
+    - JointEntropy
+    - Contrast
+    - Correlation
+    - DifferenceEntropy
+    - Idm
+    - Imc1
+
+  glrlm:
+    - RunEntropy
+    - GrayLevelNonUniformity
+    - RunLengthNonUniformity
+    - ShortRunEmphasis
+    - LongRunEmphasis
+
+  glszm:
+    - ZoneEntropy
+    - GrayLevelNonUniformity
+    - SizeZoneNonUniformity
+    - SmallAreaEmphasis
+    - LargeAreaEmphasis
+
+  gldm:
+    - DependenceEntropy
+    - DependenceNonUniformity
+    - SmallDependenceEmphasis
+    - LargeDependenceEmphasis
+    - GrayLevelNonUniformity
+
+  ngtdm:
+    - Coarseness
+    - Busyness
+    - Complexity
+    - Contrast
+    - Strength
+
+
+
+4) What I would call the final outputs in the paper
+Density endpoints
+bilateral volumetric density percent
+right and left volumetric density percent
+absolute fibroglandular volume
+absolute fat volume
+density asymmetry
+Complexity endpoints
+
+Use either:
+
+the individual prespecified features above, then reduce them statistically, or
+a single CT parenchymal complexity signature derived from those prespecified features inside the training workflow
+5) Best practical workflow
+Segment whole breast.
+Segment fibroglandular/parenchyma.
+Compute density metrics from volume masks.
+Extract the above PyRadiomics panel from the parenchymal mask.
+Keep only reproducible features with reader-repeat testing.
+Build the final signature after redundancy filtering and penalized regression.
