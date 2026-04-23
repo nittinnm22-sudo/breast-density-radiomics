@@ -5125,7 +5125,7 @@ class GLCMFeatures(_BDTextureFeatureBase):
                  "ClusterProminence": "glcm_cluster_prominence", "MCC": "glcm_mcc",
                  "DifferenceVariance": "glcm_diff_variance", "SumEntropy": "glcm_sum_entropy"}
         rad_out = self._pyradiomics_features(ct_volume, parenchymal_mask, "glcm", names)
-        if any(v != 0.0 for v in rad_out.values()):
+        if any(not (v != v) for v in rad_out.values()):
             return rad_out
 
         q = _bd_prepare_quantized_volume(ct_volume, parenchymal_mask)
@@ -5170,7 +5170,7 @@ class GLCMFeatures(_BDTextureFeatureBase):
         p_y_s = np.where(p_y > 0, p_y, 1.0)
         q_mcc = (glcm / p_y_s[np.newaxis, :]) @ glcm.T / (p_x_s[:, np.newaxis] * p_x_s[np.newaxis, :])
         ev = np.sort(np.real(np.linalg.eigvals(q_mcc)))[::-1]
-        mcc = float(np.sqrt(max(ev[1], 0.0))) if len(ev) > 1 else 0.0
+        mcc = float(np.sqrt(max(ev[1], 0.0))) if len(ev) > 1 else float("nan")
         return {"glcm_contrast": round(contrast, 6), "glcm_correlation": round(correlation, 6),
                 "glcm_joint_entropy": round(joint_entropy, 6), "glcm_joint_energy": round(joint_energy, 6),
                 "glcm_homogeneity": round(homogeneity, 6), "glcm_cluster_shade": round(cluster_shade, 6),
@@ -5186,7 +5186,7 @@ class GLRLMFeatures(_BDTextureFeatureBase):
                  "RunPercentage": "glrlm_run_percentage", "RunEntropy": "glrlm_run_entropy",
                  "ShortRunHighGrayLevelEmphasis": "glrlm_srhgle", "LongRunHighGrayLevelEmphasis": "glrlm_lrhgle"}
         rad_out = self._pyradiomics_features(ct_volume, parenchymal_mask, "glrlm", names)
-        if any(v != 0.0 for v in rad_out.values()):
+        if any(not (v != v) for v in rad_out.values()):
             return rad_out
 
         q = _bd_prepare_quantized_volume(ct_volume, parenchymal_mask)
@@ -5250,7 +5250,7 @@ class GLSZMFeatures(_BDTextureFeatureBase):
                  "ZoneSizeNonUniformity": "glszm_zone_size_non_uniformity",
                  "ZonePercentage": "glszm_zone_percentage", "SmallAreaHighGrayLevelEmphasis": "glszm_sahgle"}
         rad_out = self._pyradiomics_features(ct_volume, parenchymal_mask, "glszm", names)
-        if any(v != 0.0 for v in rad_out.values()):
+        if any(not (v != v) for v in rad_out.values()):
             return rad_out
 
         q = _bd_prepare_quantized_volume(ct_volume, parenchymal_mask)
@@ -5302,7 +5302,7 @@ class GLDMFeatures(_BDTextureFeatureBase):
                  "LargeDependenceEmphasis": "gldm_large_dependence_emphasis",
                  "GrayLevelNonUniformity": "gldm_gl_non_uniformity"}
         rad_out = self._pyradiomics_features(ct_volume, parenchymal_mask, "gldm", names)
-        if any(v != 0.0 for v in rad_out.values()):
+        if any(not (v != v) for v in rad_out.values()):
             return rad_out
 
         q = _bd_prepare_quantized_volume(ct_volume, parenchymal_mask)
@@ -5332,8 +5332,8 @@ class GLDMFeatures(_BDTextureFeatureBase):
         glnu_gldm = float(np.sum(gldm.sum(axis=1) ** 2)) / total
         dep_probs = gldm / (gldm.sum() + 1e-12)
         dep_ent = float(-np.sum(dep_probs * np.log2(dep_probs + 1e-12)))
-        sde = float(np.sum(dep_probs[:, 1:] / ((dep_idx[1:] ** 2) + 1e-12))) if max_dep > 1 else 0.0
-        lde = float(np.sum(dep_probs[:, 1:] * (dep_idx[1:] ** 2))) if max_dep > 1 else 0.0
+        sde = float(np.sum(dep_probs[:, 1:] / ((dep_idx[1:] ** 2) + 1e-12))) if max_dep > 1 else float("nan")
+        lde = float(np.sum(dep_probs[:, 1:] * (dep_idx[1:] ** 2))) if max_dep > 1 else float("nan")
         return {"gldm_dependence_non_uniformity": round(dnu, 6), "gldm_dependence_entropy": round(dep_ent, 6),
                 "gldm_small_dependence_emphasis": round(sde, 6), "gldm_large_dependence_emphasis": round(lde, 6),
                 "gldm_gl_non_uniformity": round(glnu_gldm, 6)}
@@ -5344,7 +5344,7 @@ class NGTDMFeatures(_BDTextureFeatureBase):
         names = {"Coarseness": "ngtdm_coarseness", "Busyness": "ngtdm_busyness",
                  "Complexity": "ngtdm_complexity", "Contrast": "ngtdm_contrast", "Strength": "ngtdm_strength"}
         rad_out = self._pyradiomics_features(ct_volume, parenchymal_mask, "ngtdm", names)
-        if any(v != 0.0 for v in rad_out.values()):
+        if any(not (v != v) for v in rad_out.values()):
             return rad_out
 
         q = _bd_prepare_quantized_volume(ct_volume, parenchymal_mask)
@@ -5418,7 +5418,7 @@ class ParenchymalComplexityEngine:
         gldm = GLDMFeatures().compute(self.ct_volume, self.parenchymal_mask)
         ngtdm = NGTDMFeatures().compute(self.ct_volume, self.parenchymal_mask)
         all_feats = {**shape, **first_order, **glcm, **glrlm, **glszm, **gldm, **ngtdm}
-        shortlist = {k: all_feats.get(k, 0.0) for k in _BD_MANUSCRIPT_SHORTLIST_FEATURES}
+        shortlist = {k: all_feats.get(k, float("nan")) for k in _BD_MANUSCRIPT_SHORTLIST_FEATURES}
         return {**all_feats, "manuscript_shortlist": shortlist}
 
 

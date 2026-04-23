@@ -404,7 +404,7 @@ class GLCMFeatures(_TextureFeatureBase):
         p_over_py = p / p_y_safe[np.newaxis, :]   # (N, N)
         q_mcc = (p_over_py @ p.T) / (p_x_safe[:, np.newaxis] * p_x_safe[np.newaxis, :])
         eigvals_mcc = np.sort(np.real(np.linalg.eigvals(q_mcc)))[::-1]
-        mcc = float(np.sqrt(max(eigvals_mcc[1], 0.0))) if len(eigvals_mcc) > 1 else 0.0
+        mcc = float(np.sqrt(max(eigvals_mcc[1], 0.0))) if len(eigvals_mcc) > 1 else float("nan")
 
         return {
             "glcm_contrast": float(np.sum(((ii - jj) ** 2) * p)),
