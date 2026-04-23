@@ -4954,10 +4954,11 @@ class ShapeFeatures:
         vox_cc = _bd_voxel_volume_cc(voxel_spacing_mm)
         volume_cc = float(np.count_nonzero(parenchymal_mask)) * vox_cc
         try:
-            # voxel_spacing_mm is (z,y,x); marching_cubes expects (row,col,depth) = (z,y,x) spacing
+            # voxel_spacing_mm is (z,y,x); marching_cubes 'spacing' follows the same axis order
+            # as the array (row, col, depth) = (z, y, x), so pass them in (z,y,x) order.
             z_sp, y_sp, x_sp = voxel_spacing_mm
-            spacing_xyz = (z_sp, y_sp, x_sp)
-            verts, faces, _, _ = _bd_marching_cubes(parenchymal_mask.astype(np.float32), level=0.5, spacing=spacing_xyz)
+            spacing_zyx_mc = (z_sp, y_sp, x_sp)
+            verts, faces, _, _ = _bd_marching_cubes(parenchymal_mask.astype(np.float32), level=0.5, spacing=spacing_zyx_mc)
             surface_mm2 = float(_bd_mesh_surface_area(verts, faces))
             volume_mm3 = volume_cc * 1000.0
             svr = _bd_safe_div(surface_mm2, volume_mm3)
@@ -5160,7 +5161,7 @@ class GLSZMFeatures(_BDTextureFeatureBase):
             vals = q_masked[comp]
             vals = vals[vals >= 0]  # exclude out-of-mask sentinels
             # Use modal gray level — a zone may span a few quantized values; take the most common one
-            gray = int(np.bincount(vals.astype(np.intp), minlength=n_g).argmax()) if vals.size > 0 else 0
+            gray = int(np.bincount(vals.astype(np.int64), minlength=n_g).argmax()) if vals.size > 0 else 0
             zone_size = int(np.count_nonzero(comp)) - 1
             if 0 <= gray < n_g and 0 <= zone_size < max_zone:
                 glszm[gray, zone_size] += 1
