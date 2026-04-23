@@ -5748,8 +5748,9 @@ class V21BreastDensityTab(QtWidgets.QWidget):
         BreastSegmentor.exclude_non_parenchymal() — no extra buttons are required.
         """
         overlays: dict = {}
-        right_whole = self._whole_masks.get("right_mask") or self._roi_right
-        left_whole = self._whole_masks.get("left_mask") or self._roi_left
+        _wm = self._whole_masks
+        right_whole = _wm.get("right_mask") if _wm.get("right_mask") is not None else self._roi_right
+        left_whole  = _wm.get("left_mask")  if _wm.get("left_mask")  is not None else self._roi_left
         if right_whole is not None:
             overlays[(0, 200, 200, 55)] = right_whole       # cyan — right whole breast
         if left_whole is not None:
@@ -6218,8 +6219,9 @@ class V21BreastDensityTab(QtWidgets.QWidget):
             return
 
         # Collect masks (all optional)
-        right_whole = self._whole_masks.get("right_mask") or self._roi_right
-        left_whole  = self._whole_masks.get("left_mask")  or self._roi_left
+        _wm = self._whole_masks
+        right_whole = _wm.get("right_mask") if _wm.get("right_mask") is not None else self._roi_right
+        left_whole  = _wm.get("left_mask")  if _wm.get("left_mask")  is not None else self._roi_left
         right_fg    = self._fg_masks.get("right")
         left_fg     = self._fg_masks.get("left")
         tumor_excl  = self._roi_tumor_exclusion
@@ -6236,6 +6238,14 @@ class V21BreastDensityTab(QtWidgets.QWidget):
                 if z_indices.size:
                     z_center = int(z_indices[len(z_indices) // 2])
                     slice_specs.append((label, z_center))
+        # Fallback: derive from fibroglandular masks when no whole-breast mask is available
+        if not slice_specs:
+            for label, fg_mask in (("RIGHT", right_fg), ("LEFT", left_fg)):
+                if fg_mask is not None and fg_mask.any():
+                    z_indices = np.where(np.any(fg_mask, axis=(1, 2)))[0]
+                    if z_indices.size:
+                        z_center = int(z_indices[len(z_indices) // 2])
+                        slice_specs.append((label, z_center))
         # Add a mid-volume bilateral slice if both sides are present
         if right_whole is not None and left_whole is not None:
             combined = right_whole | left_whole
@@ -6244,9 +6254,21 @@ class V21BreastDensityTab(QtWidgets.QWidget):
                 if z_indices.size:
                     z_center = int(z_indices[len(z_indices) // 2])
                     slice_specs.append(("BILATERAL", z_center))
+        # De-duplicate slices (bilateral may coincide with a single-side centroid)
+        seen_z: set = set()
+        unique_specs: list = []
+        for spec in slice_specs:
+            if spec[1] not in seen_z:
+                seen_z.add(spec[1])
+                unique_specs.append(spec)
+        slice_specs = unique_specs
 
         if not slice_specs:
-            QtWidgets.QMessageBox.warning(self, "Export Figure", "Could not determine representative slices.")
+            QtWidgets.QMessageBox.warning(
+                self, "Export Figure",
+                "Could not determine representative slices.\n"
+                "Make sure at least one breast ROI or fibroglandular mask is non-empty."
+            )
             return
 
         # Layer definition: (mask_or_None, rgba_0_1, legend_label)
@@ -6257,7 +6279,11 @@ class V21BreastDensityTab(QtWidgets.QWidget):
 
         try:
             import matplotlib as _mpl
-            _mpl.use("Agg")
+            if _mpl.get_backend().lower() not in ("agg",):
+                try:
+                    _mpl.use("Agg")
+                except Exception:
+                    pass  # backend already set; proceed anyway
             import matplotlib.pyplot as plt
             import matplotlib.patches as mpatches
             from matplotlib.colors import ListedColormap
