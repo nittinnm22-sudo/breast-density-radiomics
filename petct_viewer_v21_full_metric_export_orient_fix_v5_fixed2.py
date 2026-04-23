@@ -5596,10 +5596,7 @@ class V21BreastDensityTab(QtWidgets.QWidget):
             self._btn_segment_fg, self._btn_density, self._btn_complexity,
             self._btn_complexity_right, self._btn_complexity_left,
         ]
-        for btn in action_btns:
-            btn.setEnabled(not busy if btn.isEnabled() or not busy else False)
         if busy:
-            # Disable every action button unconditionally while busy
             for btn in action_btns:
                 btn.setEnabled(False)
             self._lbl_busy.setText(f"⏳  {message}")
@@ -5607,7 +5604,6 @@ class V21BreastDensityTab(QtWidgets.QWidget):
         else:
             self._lbl_busy.setVisible(False)
             # Re-enable buttons that should be active based on current state
-            has_fg = bool(self._fg_masks)
             self._btn_segment_fg.setEnabled(BREAST_DENSITY_DEPS_AVAILABLE)
             self._btn_density.setEnabled(BREAST_DENSITY_DEPS_AVAILABLE)
             self._btn_complexity.setEnabled(BREAST_DENSITY_DEPS_AVAILABLE and self._parenchymal_mask is not None)
