@@ -5307,15 +5307,30 @@ def _bd_train_classifiers(df, feature_columns, target_col):
 
 # ═══ V21BreastDensityTab — PyQt6 widget for Clinical Tools dialog ═══
 class V21BreastDensityTab(QtWidgets.QWidget):
-    """Breast density and parenchymal complexity analysis tab for the Clinical Tools dialog."""
+    """Breast density and parenchymal complexity analysis tab for the Clinical Tools dialog.
+
+    Workflow:
+    1. Draw ROI in the main viewer (Paint / Lasso — any orthogonal view; all views sync in real time).
+    2. Click '🔵 Label as LEFT Breast' or '🔴 Label as RIGHT Breast' to assign the drawn ROI.
+       - Each label copies the current viewer mask into a per-breast store.
+       - You can draw a new ROI and label the other breast separately.
+    3. Click '🔬 Segment Fibroglandular Tissue' to run BreastSegmentor on the labelled breast masks
+       and strip skin / pectoralis / clips — independently for each side.
+    4. Alternatively, '▶ Compute Density (Auto)' performs fully automatic bilateral segmentation.
+    5. '▶ Compute Complexity' runs radiomics on whichever parenchymal mask is active.
+    6. '💾 Export CSV' saves all per-breast and bilateral metrics.
+    """
 
     def __init__(self, app):
         super().__init__()
         self._app = app
         self._density_results: dict = {}
         self._complexity_results: dict = {}
-        self._whole_masks: dict = {}
-        self._parenchymal_mask = None
+        self._whole_masks: dict = {}          # keyed "left_mask" / "right_mask"
+        self._fg_masks: dict = {}             # fibroglandular masks per side after segmentation
+        self._parenchymal_mask = None         # active mask fed to complexity engine
+        self._roi_left: Optional[np.ndarray] = None    # manually labelled left breast ROI
+        self._roi_right: Optional[np.ndarray] = None   # manually labelled right breast ROI
         self._build()
 
     # ------------------------------------------------------------------
@@ -5334,27 +5349,83 @@ class V21BreastDensityTab(QtWidgets.QWidget):
             warn.setWordWrap(True)
             root.addWidget(warn)
 
-        # --- Compute buttons row ---
+        # ── ROI guidance label ──────────────────────────────────────────
+        roi_hint = QtWidgets.QLabel(
+            "Tip — Draw breast ROI in the main viewer using Paint or Lasso on any view (sagittal recommended). "
+            "Changes update all three orthogonal views in real time.\n"
+            "Label each breast separately using the buttons below, then run fibroglandular segmentation "
+            "or auto-density."
+        )
+        roi_hint.setStyleSheet("color: #1a5276; background: #eaf4fc; padding: 5px; border-radius: 4px;")
+        roi_hint.setWordWrap(True)
+        root.addWidget(roi_hint)
+
+        # ── Per-breast ROI labelling row ────────────────────────────────
+        label_grp = QtWidgets.QGroupBox("Step 1 — Label drawn ROI per breast")
+        label_lay = QtWidgets.QVBoxLayout(label_grp)
+        label_row = QtWidgets.QHBoxLayout()
+
+        self._btn_label_right = QtWidgets.QPushButton("🔴  Label as RIGHT Breast")
+        self._btn_label_right.setToolTip(
+            "Copies the currently drawn ROI in the main viewer as the RIGHT breast mask.\n"
+            "Draw ROI over the right breast first, then click this button."
+        )
+        self._btn_label_right.setStyleSheet("QPushButton { color: #c0392b; font-weight: bold; }")
+        self._btn_label_right.clicked.connect(lambda: self._on_label_roi("right"))
+        label_row.addWidget(self._btn_label_right)
+
+        self._btn_label_left = QtWidgets.QPushButton("🔵  Label as LEFT Breast")
+        self._btn_label_left.setToolTip(
+            "Copies the currently drawn ROI in the main viewer as the LEFT breast mask.\n"
+            "Draw ROI over the left breast, then click this button."
+        )
+        self._btn_label_left.setStyleSheet("QPushButton { color: #1a5276; font-weight: bold; }")
+        self._btn_label_left.clicked.connect(lambda: self._on_label_roi("left"))
+        label_row.addWidget(self._btn_label_left)
+
+        self._btn_clear_labels = QtWidgets.QPushButton("✖  Clear Labels")
+        self._btn_clear_labels.setToolTip("Remove stored left / right ROI labels.")
+        self._btn_clear_labels.clicked.connect(self._on_clear_labels)
+        label_row.addWidget(self._btn_clear_labels)
+        label_row.addStretch()
+        label_lay.addLayout(label_row)
+
+        self._lbl_roi_status = QtWidgets.QLabel("No breast ROIs labelled yet.")
+        self._lbl_roi_status.setStyleSheet("color: #5d6d7e; font-style: italic;")
+        label_lay.addWidget(self._lbl_roi_status)
+        root.addWidget(label_grp)
+
+        # ── Segmentation / density row ──────────────────────────────────
+        seg_grp = QtWidgets.QGroupBox("Step 2 — Segment fibroglandular tissue & compute density")
+        seg_lay = QtWidgets.QVBoxLayout(seg_grp)
         btn_row = QtWidgets.QHBoxLayout()
+
+        self._btn_segment_fg = QtWidgets.QPushButton("🔬  Segment Fibroglandular Tissue")
+        self._btn_segment_fg.setEnabled(BREAST_DENSITY_DEPS_AVAILABLE)
+        self._btn_segment_fg.setToolTip(
+            "Run BreastSegmentor.segment_fibroglandular + exclude_non_parenchymal on the\n"
+            "labelled left and right breast ROIs independently.\n"
+            "Strips skin, pectoralis muscle, and metallic clips from each breast separately.\n"
+            "Requires at least one labelled breast ROI."
+        )
+        self._btn_segment_fg.clicked.connect(self._on_segment_fg)
+        btn_row.addWidget(self._btn_segment_fg)
+
         self._btn_density = QtWidgets.QPushButton("▶  Compute Density (Auto)")
         self._btn_density.setEnabled(BREAST_DENSITY_DEPS_AVAILABLE)
-        self._btn_density.setToolTip("Run automatic whole-breast segmentation and volumetric density computation on loaded CT")
+        self._btn_density.setToolTip(
+            "Run automatic whole-breast segmentation and volumetric density computation on loaded CT.\n"
+            "Computes left and right breast metrics independently."
+        )
         self._btn_density.clicked.connect(self._on_compute_density)
         btn_row.addWidget(self._btn_density)
 
-        self._btn_use_roi = QtWidgets.QPushButton("🖊  Use Viewer ROI as Mask")
-        self._btn_use_roi.setEnabled(BREAST_DENSITY_DEPS_AVAILABLE)
-        self._btn_use_roi.setToolTip(
-            "Use the ROI drawn in the main viewer (green mask) as the breast mask for complexity analysis.\n"
-            "Workflow: draw ROI over both breasts in the main viewer (paint/lasso in any view), "
-            "then click this button to analyse that exact region."
-        )
-        self._btn_use_roi.clicked.connect(self._on_use_viewer_roi)
-        btn_row.addWidget(self._btn_use_roi)
-
         self._btn_complexity = QtWidgets.QPushButton("▶  Compute Complexity")
         self._btn_complexity.setEnabled(False)
-        self._btn_complexity.setToolTip("Run parenchymal complexity radiomics (requires Density or ROI mask first)")
+        self._btn_complexity.setToolTip(
+            "Run parenchymal complexity radiomics on the fibroglandular mask.\n"
+            "Run 'Segment Fibroglandular Tissue' or 'Compute Density (Auto)' first."
+        )
         self._btn_complexity.clicked.connect(self._on_compute_complexity)
         btn_row.addWidget(self._btn_complexity)
 
@@ -5363,16 +5434,26 @@ class V21BreastDensityTab(QtWidgets.QWidget):
         self._btn_export.clicked.connect(self._on_export_csv)
         btn_row.addWidget(self._btn_export)
         btn_row.addStretch()
-        root.addLayout(btn_row)
+        seg_lay.addLayout(btn_row)
+        root.addWidget(seg_grp)
 
-        # --- ROI guidance label ---
-        roi_hint = QtWidgets.QLabel(
-            "Tip — Draw breast ROI in the main viewer using Paint or Lasso on any view (sagittal recommended).\n"
-            "Changes update all three orthogonal views in real time. Then click '🖊 Use Viewer ROI as Mask'."
-        )
-        roi_hint.setStyleSheet("color: #1a5276; background: #eaf4fc; padding: 5px; border-radius: 4px;")
-        roi_hint.setWordWrap(True)
-        root.addWidget(roi_hint)
+        # ── Per-breast complexity row ───────────────────────────────────
+        side_grp = QtWidgets.QGroupBox("Per-breast complexity (after fibroglandular segmentation)")
+        side_lay = QtWidgets.QHBoxLayout(side_grp)
+
+        self._btn_complexity_right = QtWidgets.QPushButton("🔴  Complexity: RIGHT")
+        self._btn_complexity_right.setEnabled(False)
+        self._btn_complexity_right.setToolTip("Run complexity radiomics on the RIGHT fibroglandular mask only.")
+        self._btn_complexity_right.clicked.connect(lambda: self._on_compute_complexity_side("right"))
+        side_lay.addWidget(self._btn_complexity_right)
+
+        self._btn_complexity_left = QtWidgets.QPushButton("🔵  Complexity: LEFT")
+        self._btn_complexity_left.setEnabled(False)
+        self._btn_complexity_left.setToolTip("Run complexity radiomics on the LEFT fibroglandular mask only.")
+        self._btn_complexity_left.clicked.connect(lambda: self._on_compute_complexity_side("left"))
+        side_lay.addWidget(self._btn_complexity_left)
+        side_lay.addStretch()
+        root.addWidget(side_grp)
 
         # --- Results tabs ---
         self._result_tabs = QtWidgets.QTabWidget()
@@ -5443,6 +5524,15 @@ class V21BreastDensityTab(QtWidgets.QWidget):
         root.addWidget(self._log)
 
     # ------------------------------------------------------------------
+    def _update_roi_status(self):
+        parts = []
+        if self._roi_right is not None:
+            parts.append(f"🔴 RIGHT  ({int(np.sum(self._roi_right))} vox)")
+        if self._roi_left is not None:
+            parts.append(f"🔵 LEFT   ({int(np.sum(self._roi_left))} vox)")
+        self._lbl_roi_status.setText("  |  ".join(parts) if parts else "No breast ROIs labelled yet.")
+
+    # ------------------------------------------------------------------
     @staticmethod
     def _make_kv_table() -> QtWidgets.QTableWidget:
         tbl = QtWidgets.QTableWidget(0, 2)
@@ -5470,6 +5560,138 @@ class V21BreastDensityTab(QtWidgets.QWidget):
         self._log.appendPlainText(msg)
 
     # ------------------------------------------------------------------
+    # ROI labelling
+    # ------------------------------------------------------------------
+    def _on_label_roi(self, side: str):
+        """Snapshot the current viewer ROI mask and tag it as the given breast side."""
+        roi_mask = getattr(self._app, "mask_primary", None)
+        if roi_mask is None:
+            roi_mask = getattr(self._app, "mask", None)
+        if roi_mask is None or not np.any(roi_mask):
+            QtWidgets.QMessageBox.warning(
+                self, "Label ROI",
+                f"No ROI drawn in the main viewer yet.\n\n"
+                f"Switch to Paint or Lasso mode, draw the {'RIGHT' if side == 'right' else 'LEFT'} "
+                f"breast region, then click this button."
+            )
+            return
+        snap = roi_mask.astype(bool).copy()
+        if side == "right":
+            self._roi_right = snap
+            self._log_msg(f"[ROI] RIGHT breast labelled — {int(np.sum(snap))} voxels.")
+        else:
+            self._roi_left = snap
+            self._log_msg(f"[ROI] LEFT breast labelled — {int(np.sum(snap))} voxels.")
+        self._update_roi_status()
+        # Enable fibroglandular segmentation now that at least one side is labelled
+        self._btn_segment_fg.setEnabled(BREAST_DENSITY_DEPS_AVAILABLE)
+
+    def _on_clear_labels(self):
+        self._roi_left = None
+        self._roi_right = None
+        self._fg_masks = {}
+        self._parenchymal_mask = None
+        self._update_roi_status()
+        self._btn_complexity.setEnabled(False)
+        self._btn_complexity_left.setEnabled(False)
+        self._btn_complexity_right.setEnabled(False)
+        self._log_msg("[ROI] Left / right labels cleared.")
+
+    # ------------------------------------------------------------------
+    # Fibroglandular segmentation on per-breast ROIs
+    # ------------------------------------------------------------------
+    def _on_segment_fg(self):
+        """Run fibroglandular segmentation independently on each labelled breast ROI.
+
+        This is the dedicated 'Step 2' button.  It uses the manually drawn ROIs as the
+        whole-breast masks — exactly matching the user-drawn boundary — and then:
+          1. BreastSegmentor.segment_fibroglandular()  — HU threshold inside the ROI
+          2. BreastSegmentor.exclude_non_parenchymal() — strips skin shell, pectoralis, clips
+        Results are stored per-side and shown in the Density results table.
+        """
+        ct_hu = getattr(self._app, "ct_hu", None)
+        if ct_hu is None:
+            QtWidgets.QMessageBox.warning(self, "Segment FG", "No CT volume loaded.")
+            return
+        if self._roi_left is None and self._roi_right is None:
+            QtWidgets.QMessageBox.warning(
+                self, "Segment FG",
+                "No breast ROIs labelled yet.\n\n"
+                "Draw the right breast ROI in the viewer, click '🔴 Label as RIGHT Breast', "
+                "then draw the left breast and click '🔵 Label as LEFT Breast'."
+            )
+            return
+        spacing = getattr(self._app, "spacing_zyx", (1.0, 1.0, 1.0))
+        voxel_spacing_mm = (float(spacing[0]), float(spacing[1]), float(spacing[2]))
+        vox_cc = float(np.prod(voxel_spacing_mm) / 1000.0)
+        self._log_msg("[FG] Running fibroglandular segmentation on labelled ROIs …")
+        QtWidgets.QApplication.processEvents()
+        try:
+            segmentor = BreastSegmentor()
+            results: dict = {}
+            self._fg_masks = {}
+
+            for side, roi in (("right", self._roi_right), ("left", self._roi_left)):
+                if roi is None:
+                    continue
+                whole_vol_cc = float(np.sum(roi)) * vox_cc
+                fg_raw = segmentor.segment_fibroglandular(ct_hu, roi)
+                fg_clean = segmentor.exclude_non_parenchymal(fg_raw, ct_hu)
+                # Restrict cleaned mask to the drawn ROI boundary
+                fg_clean = fg_clean & roi
+                fg_vol_cc = float(np.sum(fg_clean)) * vox_cc
+                fat_vol_cc = max(0.0, whole_vol_cc - fg_vol_cc)
+                self._fg_masks[side] = fg_clean
+                results.update({
+                    f"{side}_breast_roi_vol_cc": round(whole_vol_cc, 3),
+                    f"{side}_fibroglandular_vol_cc": round(fg_vol_cc, 3),
+                    f"{side}_fat_vol_cc": round(fat_vol_cc, 3),
+                    f"{side}_volumetric_density_pct": round(
+                        fg_vol_cc / whole_vol_cc * 100.0 if whole_vol_cc > 0 else 0.0, 3),
+                    f"{side}_roi_source": "manual_viewer_roi",
+                })
+                self._log_msg(f"[FG] {side.upper()}: whole={whole_vol_cc:.1f} cc, "
+                              f"FG={fg_vol_cc:.1f} cc, density="
+                              f"{results[f'{side}_volumetric_density_pct']:.1f}%")
+
+            # Bilateral totals if both sides available
+            if "right" in self._fg_masks and "left" in self._fg_masks:
+                r_fg = results["right_fibroglandular_vol_cc"]
+                l_fg = results["left_fibroglandular_vol_cc"]
+                r_w = results["right_breast_roi_vol_cc"]
+                l_w = results["left_breast_roi_vol_cc"]
+                total_whole = r_w + l_w
+                total_fg = r_fg + l_fg
+                results.update({
+                    "bilateral_whole_breast_vol_cc": round(total_whole, 3),
+                    "bilateral_fibroglandular_vol_cc": round(total_fg, 3),
+                    "bilateral_volumetric_density_pct": round(
+                        total_fg / total_whole * 100.0 if total_whole > 0 else 0.0, 3),
+                    "density_asymmetry_pct": round(
+                        abs(results["right_volumetric_density_pct"] -
+                            results["left_volumetric_density_pct"]), 3),
+                })
+
+            self._density_results = results
+            self._fill_table(self._density_table, results)
+            self._result_tabs.setCurrentIndex(0)
+
+            # Use union of available FG masks as the active parenchymal mask
+            fg_union = None
+            for m in self._fg_masks.values():
+                fg_union = m if fg_union is None else (fg_union | m)
+            self._parenchymal_mask = fg_union
+
+            self._btn_complexity.setEnabled(BREAST_DENSITY_DEPS_AVAILABLE and fg_union is not None)
+            self._btn_complexity_right.setEnabled(BREAST_DENSITY_DEPS_AVAILABLE and "right" in self._fg_masks)
+            self._btn_complexity_left.setEnabled(BREAST_DENSITY_DEPS_AVAILABLE and "left" in self._fg_masks)
+            self._btn_export.setEnabled(True)
+            self._log_msg("[FG] Done.")
+        except Exception as exc:
+            self._log_msg(f"[FG] ERROR: {exc}")
+            QtWidgets.QMessageBox.critical(self, "FG Segmentation Error", str(exc))
+
+    # ------------------------------------------------------------------
     def _on_compute_density(self):
         ct_hu = getattr(self._app, "ct_hu", None)
         if ct_hu is None:
@@ -5482,97 +5704,117 @@ class V21BreastDensityTab(QtWidgets.QWidget):
         try:
             segmentor = BreastSegmentor()
             self._whole_masks = segmentor.segment_whole_breast(ct_hu)
-            bilateral_fg = (
-                segmentor.segment_fibroglandular(ct_hu, self._whole_masks["right_mask"]) |
-                segmentor.segment_fibroglandular(ct_hu, self._whole_masks["left_mask"])
-            )
-            self._parenchymal_mask = segmentor.exclude_non_parenchymal(bilateral_fg, ct_hu)
-            self._density_results = BreastCTDensityEngine().compute_volumetric_density(ct_hu, voxel_spacing_mm)
-            self._fill_table(self._density_table, self._density_results)
+            vox_cc = float(np.prod(voxel_spacing_mm) / 1000.0)
+            self._fg_masks = {}
+            results: dict = {}
+            for side in ("right", "left"):
+                breast_mask = self._whole_masks[f"{side}_mask"]
+                fg_raw = segmentor.segment_fibroglandular(ct_hu, breast_mask)
+                fg_clean = segmentor.exclude_non_parenchymal(fg_raw, ct_hu)
+                self._fg_masks[side] = fg_clean
+                whole_vol_cc = float(np.sum(breast_mask)) * vox_cc
+                fg_vol_cc = float(np.sum(fg_clean)) * vox_cc
+                fat_vol_cc = max(0.0, whole_vol_cc - fg_vol_cc)
+                results.update({
+                    f"{side}_whole_breast_vol_cc": round(whole_vol_cc, 3),
+                    f"{side}_fibroglandular_vol_cc": round(fg_vol_cc, 3),
+                    f"{side}_fat_vol_cc": round(fat_vol_cc, 3),
+                    f"{side}_volumetric_density_pct": round(
+                        fg_vol_cc / whole_vol_cc * 100.0 if whole_vol_cc > 0 else 0.0, 3),
+                    f"{side}_roi_source": "auto_segmentation",
+                })
+                self._log_msg(f"[Density] {side.upper()}: whole={whole_vol_cc:.1f} cc, "
+                              f"FG={fg_vol_cc:.1f} cc, density="
+                              f"{results[f'{side}_volumetric_density_pct']:.1f}%")
+            r_w = results["right_whole_breast_vol_cc"]
+            l_w = results["left_whole_breast_vol_cc"]
+            r_fg = results["right_fibroglandular_vol_cc"]
+            l_fg = results["left_fibroglandular_vol_cc"]
+            total_whole = r_w + l_w
+            total_fg = r_fg + l_fg
+            results.update({
+                "bilateral_whole_breast_vol_cc": round(total_whole, 3),
+                "bilateral_fibroglandular_vol_cc": round(total_fg, 3),
+                "bilateral_volumetric_density_pct": round(
+                    total_fg / total_whole * 100.0 if total_whole > 0 else 0.0, 3),
+                "density_asymmetry_pct": round(
+                    abs(results["right_volumetric_density_pct"] -
+                        results["left_volumetric_density_pct"]), 3),
+            })
+            self._density_results = results
+            self._fill_table(self._density_table, results)
             self._result_tabs.setCurrentIndex(0)
+            fg_union = self._fg_masks["right"] | self._fg_masks["left"]
+            self._parenchymal_mask = fg_union
             self._btn_complexity.setEnabled(BREAST_DENSITY_DEPS_AVAILABLE)
+            self._btn_complexity_right.setEnabled(BREAST_DENSITY_DEPS_AVAILABLE)
+            self._btn_complexity_left.setEnabled(BREAST_DENSITY_DEPS_AVAILABLE)
             self._btn_export.setEnabled(True)
             self._log_msg("[Density] Done.")
         except Exception as exc:
             self._log_msg(f"[Density] ERROR: {exc}")
             QtWidgets.QMessageBox.critical(self, "Breast Density Error", str(exc))
 
-    def _on_use_viewer_roi(self):
-        """Use the manually drawn ROI mask from the main viewer as the breast mask.
-
-        The user should draw ROI over both breasts (using Paint or Lasso in any of
-        the three orthogonal views; all views update in real time). After drawing,
-        clicking this button adopts that mask as the parenchymal mask and computes
-        volumetric metrics directly from the drawn region — bypassing auto-segmentation.
-        """
-        ct_hu = getattr(self._app, "ct_hu", None)
-        if ct_hu is None:
-            QtWidgets.QMessageBox.warning(self, "Viewer ROI", "No CT volume loaded. Load a CT study first.")
-            return
-        roi_mask = getattr(self._app, "mask_primary", None)
-        if roi_mask is None:
-            roi_mask = getattr(self._app, "mask", None)
-        if roi_mask is None or not np.any(roi_mask):
-            QtWidgets.QMessageBox.warning(
-                self, "Viewer ROI",
-                "No ROI has been drawn in the main viewer yet.\n\n"
-                "Switch to Paint or Lasso mode and draw the breast region on the CT. "
-                "You can draw on any view — axial, coronal, or sagittal — and all three "
-                "update automatically."
-            )
-            return
-        spacing = getattr(self._app, "spacing_zyx", (1.0, 1.0, 1.0))
-        voxel_spacing_mm = (float(spacing[0]), float(spacing[1]), float(spacing[2]))
-        vox_cc = float(np.prod(voxel_spacing_mm) / 1000.0)
-        self._log_msg(f"[ROI] Using viewer ROI — {int(np.sum(roi_mask))} voxels "
-                      f"= {float(np.sum(roi_mask)) * vox_cc:.1f} cc")
-        QtWidgets.QApplication.processEvents()
-        try:
-            # Treat the drawn ROI directly as the parenchymal mask.
-            # Compute basic volumetric density assuming drawn region = fibroglandular tissue
-            # within the whole breast (the full breast volume can be estimated as the bounding
-            # box convex hull, but for simplicity report drawn ROI as fibroglandular volume).
-            self._parenchymal_mask = roi_mask.astype(bool)
-            fg_vol_cc = float(np.sum(self._parenchymal_mask)) * vox_cc
-
-            # Build density result dict compatible with the existing table
-            self._density_results = {
-                "roi_fibroglandular_vol_cc": round(fg_vol_cc, 3),
-                "roi_voxel_count": int(np.sum(self._parenchymal_mask)),
-                "roi_source": "manual_viewer_roi",
-            }
-            self._fill_table(self._density_table, self._density_results)
-            self._result_tabs.setCurrentIndex(0)
-            self._btn_complexity.setEnabled(BREAST_DENSITY_DEPS_AVAILABLE)
-            self._btn_export.setEnabled(True)
-            self._log_msg("[ROI] Viewer ROI accepted as breast mask. Click '▶ Compute Complexity' to run radiomics.")
-        except Exception as exc:
-            self._log_msg(f"[ROI] ERROR: {exc}")
-            QtWidgets.QMessageBox.critical(self, "Viewer ROI Error", str(exc))
-
+    # ------------------------------------------------------------------
     def _on_compute_complexity(self):
+        """Run complexity on the bilateral parenchymal mask (union of left + right FG masks)."""
         ct_hu = getattr(self._app, "ct_hu", None)
         if ct_hu is None or self._parenchymal_mask is None:
             QtWidgets.QMessageBox.warning(self, "Breast Complexity",
-                                          "Run 'Compute Density (Auto)' or 'Use Viewer ROI as Mask' first "
+                                          "Run 'Segment Fibroglandular Tissue' or 'Compute Density (Auto)' first "
                                           "to generate a parenchymal mask.")
             return
         spacing = getattr(self._app, "spacing_zyx", (1.0, 1.0, 1.0))
         voxel_spacing_mm = (float(spacing[0]), float(spacing[1]), float(spacing[2]))
-        self._log_msg("[Complexity] Computing radiomics features …")
+        self._log_msg("[Complexity] Computing bilateral radiomics features …")
         QtWidgets.QApplication.processEvents()
         try:
             engine = ParenchymalComplexityEngine(ct_hu, self._parenchymal_mask, voxel_spacing_mm)
             self._complexity_results = engine.compute_all()
+            # Prefix bilateral keys
+            prefixed = {f"bilateral_{k}" if not k.startswith("bilateral_") else k: v
+                        for k, v in self._complexity_results.items() if k != "manuscript_shortlist"}
             self._fill_table(self._shortlist_table, self._complexity_results.get("manuscript_shortlist", {}))
-            full = {k: v for k, v in self._complexity_results.items() if k != "manuscript_shortlist"}
-            self._fill_table(self._full_table, full)
+            self._fill_table(self._full_table, prefixed)
             self._result_tabs.setCurrentIndex(1)
             self._btn_export.setEnabled(True)
-            self._log_msg("[Complexity] Done.")
+            self._log_msg("[Complexity] Done (bilateral).")
         except Exception as exc:
             self._log_msg(f"[Complexity] ERROR: {exc}")
             QtWidgets.QMessageBox.critical(self, "Complexity Error", str(exc))
+
+    def _on_compute_complexity_side(self, side: str):
+        """Run complexity radiomics on one breast's fibroglandular mask."""
+        ct_hu = getattr(self._app, "ct_hu", None)
+        fg_mask = self._fg_masks.get(side)
+        if ct_hu is None or fg_mask is None:
+            QtWidgets.QMessageBox.warning(
+                self, f"Complexity: {side.upper()}",
+                f"No fibroglandular mask for the {side.upper()} breast.\n"
+                "Run 'Segment Fibroglandular Tissue' or 'Compute Density (Auto)' first."
+            )
+            return
+        spacing = getattr(self._app, "spacing_zyx", (1.0, 1.0, 1.0))
+        voxel_spacing_mm = (float(spacing[0]), float(spacing[1]), float(spacing[2]))
+        self._log_msg(f"[Complexity] Computing {side.upper()} breast radiomics …")
+        QtWidgets.QApplication.processEvents()
+        try:
+            engine = ParenchymalComplexityEngine(ct_hu, fg_mask, voxel_spacing_mm)
+            results = engine.compute_all()
+            # Prefix keys with side so they don't overwrite bilateral results
+            prefixed = {f"{side}_{k}" if not k.startswith(side + "_") else k: v
+                        for k, v in results.items() if k != "manuscript_shortlist"}
+            # Merge into existing complexity results (per-side results live alongside bilateral)
+            self._complexity_results.update(prefixed)
+            self._fill_table(self._shortlist_table, results.get("manuscript_shortlist", {}))
+            full = {k: v for k, v in self._complexity_results.items() if k != "manuscript_shortlist"}
+            self._fill_table(self._full_table, full)
+            self._result_tabs.setCurrentIndex(2)
+            self._btn_export.setEnabled(True)
+            self._log_msg(f"[Complexity] Done ({side.upper()}).")
+        except Exception as exc:
+            self._log_msg(f"[Complexity] ERROR: {exc}")
+            QtWidgets.QMessageBox.critical(self, f"Complexity {side.upper()} Error", str(exc))
 
     def _on_export_csv(self):
         if not self._density_results and not self._complexity_results:
