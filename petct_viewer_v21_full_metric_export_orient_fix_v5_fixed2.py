@@ -4846,15 +4846,68 @@ _BD_HU_BREAST_MIN = -300
 _BD_HU_BREAST_MAX = 200
 _BD_HU_MUSCLE_MIN = 40
 _BD_HU_CLIP_MIN = 400
-_BD_VOXEL_BINS = 32
+# IBSI-recommended fixed bin width for CT radiomics (HU units).
+# VOXEL_BINS is derived so each bin spans exactly _BD_IBSI_BIN_WIDTH_HU Hounsfield units
+# across the breast tissue range [_BD_HU_BREAST_MIN, _BD_HU_BREAST_MAX].
+_BD_IBSI_BIN_WIDTH_HU = 25
+_BD_VOXEL_BINS = int(np.ceil((_BD_HU_BREAST_MAX - _BD_HU_BREAST_MIN) / _BD_IBSI_BIN_WIDTH_HU))  # = 20
 
+# Full 50-feature IBSI-aligned prespecified protocol panel.
+# Shape (9), FirstOrder (11), GLCM (6), GLRLM (5), GLSZM (5), GLDM (5), NGTDM (5).
 _BD_MANUSCRIPT_SHORTLIST_FEATURES = [
-    "surface_to_volume_ratio", "sphericity", "elongation", "flatness",
-    "std_hu", "skewness", "kurtosis", "entropy", "uniformity",
-    "glcm_contrast", "glcm_correlation", "glcm_joint_entropy",
-    "glrlm_short_run_emphasis", "glrlm_long_run_emphasis", "glrlm_run_entropy",
-    "glszm_zone_entropy", "glszm_small_area_emphasis", "glszm_large_area_emphasis",
-    "gldm_dependence_non_uniformity", "ngtdm_coarseness", "ngtdm_busyness",
+    # Shape (9)
+    "parenchymal_volume_cc",
+    "surface_area_mm2",
+    "surface_to_volume_ratio",
+    "sphericity",
+    "max_3d_diameter_mm",
+    "major_axis_length_mm",
+    "minor_axis_length_mm",
+    "elongation",
+    "flatness",
+    # First-order (11)
+    "mean_hu",
+    "median_hu",
+    "percentile_10_hu",
+    "percentile_90_hu",
+    "iqr_hu",
+    "variance_hu",
+    "std_hu",
+    "skewness",
+    "kurtosis",
+    "entropy",
+    "uniformity",
+    # GLCM (6)
+    "glcm_joint_entropy",
+    "glcm_contrast",
+    "glcm_correlation",
+    "glcm_difference_entropy",
+    "glcm_idm",
+    "glcm_imc1",
+    # GLRLM (5)
+    "glrlm_run_entropy",
+    "glrlm_gray_level_non_uniformity",
+    "glrlm_run_length_non_uniformity",
+    "glrlm_short_run_emphasis",
+    "glrlm_long_run_emphasis",
+    # GLSZM (5)
+    "glszm_zone_entropy",
+    "glszm_gray_level_non_uniformity",
+    "glszm_zone_size_non_uniformity",
+    "glszm_small_area_emphasis",
+    "glszm_large_area_emphasis",
+    # GLDM (5)
+    "gldm_dependence_entropy",
+    "gldm_dependence_non_uniformity",
+    "gldm_small_dependence_emphasis",
+    "gldm_large_dependence_emphasis",
+    "gldm_gray_level_non_uniformity",
+    # NGTDM (5)
+    "ngtdm_coarseness",
+    "ngtdm_busyness",
+    "ngtdm_complexity",
+    "ngtdm_contrast",
+    "ngtdm_strength",
 ]
 
 # --- Helper functions ---
@@ -4867,9 +4920,15 @@ def _bd_voxel_volume_cc(voxel_spacing_mm) -> float:
 
 
 def _bd_prepare_quantized_volume(ct_volume: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Clip HU and quantize masked voxels using fixed IBSI bin width.
+
+    Fixed-bin-width discretization (IBSI recommendation for CT) ensures features
+    are comparable across patients regardless of individual ROI intensity ranges.
+    Each bin spans exactly _BD_IBSI_BIN_WIDTH_HU = 25 HU.
+    """
     clipped = np.clip(ct_volume, _BD_HU_BREAST_MIN, _BD_HU_BREAST_MAX)
-    normalized = (clipped - _BD_HU_BREAST_MIN) / (_BD_HU_BREAST_MAX - _BD_HU_BREAST_MIN + 1e-8)
-    quantized = np.floor(normalized * (_BD_VOXEL_BINS - 1)).astype(np.int32)
+    quantized = np.floor((clipped - _BD_HU_BREAST_MIN) / _BD_IBSI_BIN_WIDTH_HU).astype(np.int32)
+    quantized = np.clip(quantized, 0, _BD_VOXEL_BINS - 1)
     quantized[~mask] = 0
     return quantized
 
@@ -5030,6 +5089,7 @@ class ShapeFeatures:
             svr = float("nan")
             sphericity = float("nan")
             surface_mm2 = float("nan")
+            volume_mm3 = volume_cc * 1000.0
 
         try:
             coords = np.argwhere(parenchymal_mask)
@@ -5040,18 +5100,28 @@ class ShapeFeatures:
                 eigvals = np.maximum(eigvals, 1e-8)
                 elongation = float(np.sqrt(_bd_safe_div(eigvals[1], eigvals[0])))
                 flatness = float(np.sqrt(_bd_safe_div(eigvals[2], eigvals[0])))
+                major_axis = float(4.0 * np.sqrt(eigvals[0]))
+                minor_axis = float(4.0 * np.sqrt(eigvals[2]))
+                bbox_mm = scaled.max(axis=0) - scaled.min(axis=0)
+                max_diameter = float(np.linalg.norm(bbox_mm))
             else:
                 elongation = flatness = float("nan")
+                major_axis = minor_axis = max_diameter = float("nan")
         except Exception:
             elongation = flatness = float("nan")
+            major_axis = minor_axis = max_diameter = float("nan")
 
         return {
+            "parenchymal_volume_cc": round(volume_cc, 4),
             "volume_cc": round(volume_cc, 4),
-            "surface_area_mm2": round(surface_mm2, 4),
-            "surface_to_volume_ratio": round(svr, 6),
-            "sphericity": round(sphericity, 6),
-            "elongation": round(elongation, 6),
-            "flatness": round(flatness, 6),
+            "surface_area_mm2": round(surface_mm2, 4) if surface_mm2 == surface_mm2 else float("nan"),
+            "surface_to_volume_ratio": round(svr, 6) if svr == svr else float("nan"),
+            "sphericity": round(sphericity, 6) if sphericity == sphericity else float("nan"),
+            "elongation": round(elongation, 6) if elongation == elongation else float("nan"),
+            "flatness": round(flatness, 6) if flatness == flatness else float("nan"),
+            "major_axis_length_mm": round(major_axis, 4) if major_axis == major_axis else float("nan"),
+            "minor_axis_length_mm": round(minor_axis, 4) if minor_axis == minor_axis else float("nan"),
+            "max_3d_diameter_mm": round(max_diameter, 4) if max_diameter == max_diameter else float("nan"),
         }
 
 
@@ -5064,7 +5134,8 @@ class FirstOrderFeatures:
         if len(voxels) == 0:
             return {k: float("nan") for k in ["mean_hu", "median_hu", "std_hu", "min_hu", "max_hu",
                                       "range_hu", "skewness", "kurtosis", "entropy", "uniformity",
-                                      "energy", "p10_hu", "p90_hu", "iqr_hu"]}
+                                      "energy", "percentile_10_hu", "percentile_90_hu", "iqr_hu",
+                                      "variance_hu"]}
         quantized = _bd_prepare_quantized_volume(ct_volume, parenchymal_mask)
         q_vals = quantized[parenchymal_mask]
         counts = np.bincount(q_vals, minlength=_BD_VOXEL_BINS).astype(np.float64)
@@ -5075,6 +5146,7 @@ class FirstOrderFeatures:
             "mean_hu": round(float(np.mean(voxels)), 4),
             "median_hu": round(float(np.median(voxels)), 4),
             "std_hu": round(float(np.std(voxels)), 4),
+            "variance_hu": round(float(np.var(voxels)), 4),
             "min_hu": round(float(np.min(voxels)), 4),
             "max_hu": round(float(np.max(voxels)), 4),
             "range_hu": round(float(np.ptp(voxels)), 4),
@@ -5083,8 +5155,8 @@ class FirstOrderFeatures:
             "entropy": round(ent, 6),
             "uniformity": round(uniformity, 6),
             "energy": round(float(np.sum(voxels ** 2)), 2),
-            "p10_hu": round(float(np.percentile(voxels, 10)), 4),
-            "p90_hu": round(float(np.percentile(voxels, 90)), 4),
+            "percentile_10_hu": round(float(np.percentile(voxels, 10)), 4),
+            "percentile_90_hu": round(float(np.percentile(voxels, 90)), 4),
             "iqr_hu": round(float(np.percentile(voxels, 75) - np.percentile(voxels, 25)), 4),
         }
 
@@ -5093,13 +5165,30 @@ class FirstOrderFeatures:
 class _BDTextureFeatureBase:
     @staticmethod
     def _pyradiomics_features(ct_volume: np.ndarray, mask: np.ndarray, feature_class: str, names: dict) -> dict:
+        """Run pyradiomics on the locked IBSI-compliant feature panel.
+
+        Settings:
+          binWidth=25          — fixed HU bin width (IBSI, not relative binCount)
+          voxelArrayShift=0    — IBSI first-order alignment
+          normalize=False      — raw HU values used (CT-appropriate)
+          resampledPixelSpacing=[1.2,1.2,1.2] — isotropic resampling for reproducibility
+        """
         try:
             import SimpleITK as _sitk
             from radiomics import featureextractor as _fex
-            settings = {"binWidth": 25, "resampledPixelSpacing": None, "interpolator": "sitkBSpline",
-                        "enableCExtensions": True}
-            extractor = _fex.RadiomicsFeatureExtractor(**settings)
+            extractor = _fex.RadiomicsFeatureExtractor(
+                binWidth=_BD_IBSI_BIN_WIDTH_HU,
+                voxelArrayShift=0,
+                normalize=False,
+                force2D=False,
+                resampledPixelSpacing=[1.2, 1.2, 1.2],
+                interpolator="sitkBSpline",
+                padDistance=5,
+                correctMask=True,
+                label=1,
+            )
             extractor.disableAllFeatures()
+            # Enable only the prespecified protocol features (locked panel).
             extractor.enableFeaturesByName(**{feature_class: list(names.keys())})
             img = _sitk.GetImageFromArray(ct_volume.astype(np.float32))
             msk = _sitk.GetImageFromArray(mask.astype(np.uint8))
@@ -5123,7 +5212,10 @@ class GLCMFeatures(_BDTextureFeatureBase):
                  "JointEnergy": "glcm_joint_energy", "JointEntropy": "glcm_joint_entropy",
                  "Homogeneity1": "glcm_homogeneity", "ClusterShade": "glcm_cluster_shade",
                  "ClusterProminence": "glcm_cluster_prominence", "MCC": "glcm_mcc",
-                 "DifferenceVariance": "glcm_diff_variance", "SumEntropy": "glcm_sum_entropy"}
+                 "DifferenceVariance": "glcm_diff_variance", "SumEntropy": "glcm_sum_entropy",
+                 "DifferenceEntropy": "glcm_difference_entropy",
+                 "Idm": "glcm_idm",
+                 "Imc1": "glcm_imc1"}
         rad_out = self._pyradiomics_features(ct_volume, parenchymal_mask, "glcm", names)
         if any(not (v != v) for v in rad_out.values()):
             return rad_out
@@ -5152,6 +5244,8 @@ class GLCMFeatures(_BDTextureFeatureBase):
         joint_entropy = float(-np.sum(glcm * np.log2(glcm + 1e-12)))
         joint_energy = float(np.sum(glcm ** 2))
         homogeneity = float(np.sum(glcm / (1.0 + diff ** 2)))
+        # IDM (inverse difference moment)
+        idm = float(np.sum(glcm / (1.0 + diff)))
         cluster_shade = float(np.sum(glcm * ((i_idx + j_idx - mu_i - mu_j) ** 3)))
         cluster_prominence = float(np.sum(glcm * ((i_idx + j_idx - mu_i - mu_j) ** 4)))
         # sum/diff distributions
@@ -5163,6 +5257,7 @@ class GLCMFeatures(_BDTextureFeatureBase):
         np.add.at(p_xmy, diff_idx.ravel(), glcm.ravel())
         sum_entropy = float(-np.sum(p_xpy * np.log2(p_xpy + 1e-12)))
         diff_variance = float(np.sum(np.arange(n, dtype=np.float64) ** 2 * p_xmy))
+        difference_entropy = float(-np.sum(p_xmy * np.log2(p_xmy + 1e-12)))
         # MCC
         p_x = glcm.sum(axis=1)
         p_y = glcm.sum(axis=0)
@@ -5171,18 +5266,26 @@ class GLCMFeatures(_BDTextureFeatureBase):
         q_mcc = (glcm / p_y_s[np.newaxis, :]) @ glcm.T / (p_x_s[:, np.newaxis] * p_x_s[np.newaxis, :])
         ev = np.sort(np.real(np.linalg.eigvals(q_mcc)))[::-1]
         mcc = float(np.sqrt(max(ev[1], 0.0))) if len(ev) > 1 else float("nan")
+        # IMC1 (information measure of correlation 1)
+        hx = float(-np.sum(p_x * np.log2(p_x + 1e-12)))
+        hy = float(-np.sum(p_y * np.log2(p_y + 1e-12)))
+        hxy1 = float(-np.sum(glcm * np.log2((p_x[:, None] * p_y[None, :]) + 1e-12)))
+        imc1 = _bd_safe_div(joint_entropy - hxy1, max(hx, hy) + 1e-12)
         return {"glcm_contrast": round(contrast, 6), "glcm_correlation": round(correlation, 6),
                 "glcm_joint_entropy": round(joint_entropy, 6), "glcm_joint_energy": round(joint_energy, 6),
                 "glcm_homogeneity": round(homogeneity, 6), "glcm_cluster_shade": round(cluster_shade, 6),
                 "glcm_cluster_prominence": round(cluster_prominence, 6), "glcm_mcc": round(mcc, 6),
-                "glcm_diff_variance": round(diff_variance, 6), "glcm_sum_entropy": round(sum_entropy, 6)}
+                "glcm_diff_variance": round(diff_variance, 6), "glcm_sum_entropy": round(sum_entropy, 6),
+                "glcm_difference_entropy": round(difference_entropy, 6),
+                "glcm_idm": round(idm, 6),
+                "glcm_imc1": round(imc1, 6)}
 
 
 class GLRLMFeatures(_BDTextureFeatureBase):
     def compute(self, ct_volume: np.ndarray, parenchymal_mask: np.ndarray) -> dict:
         names = {"ShortRunEmphasis": "glrlm_short_run_emphasis", "LongRunEmphasis": "glrlm_long_run_emphasis",
-                 "GrayLevelNonUniformity": "glrlm_gl_non_uniformity",
-                 "RunLengthNonUniformity": "glrlm_rl_non_uniformity",
+                 "GrayLevelNonUniformity": "glrlm_gray_level_non_uniformity",
+                 "RunLengthNonUniformity": "glrlm_run_length_non_uniformity",
                  "RunPercentage": "glrlm_run_percentage", "RunEntropy": "glrlm_run_entropy",
                  "ShortRunHighGrayLevelEmphasis": "glrlm_srhgle", "LongRunHighGrayLevelEmphasis": "glrlm_lrhgle"}
         rad_out = self._pyradiomics_features(ct_volume, parenchymal_mask, "glrlm", names)
@@ -5237,8 +5340,8 @@ class GLRLMFeatures(_BDTextureFeatureBase):
         srhgle = float(np.sum(glrlm / (r_idx ** 2 + 1e-12) * (g_idx_rl[:, np.newaxis] ** 2))) / total
         lrhgle = float(np.sum(glrlm * (r_idx ** 2) * (g_idx_rl[:, np.newaxis] ** 2))) / total
         return {"glrlm_short_run_emphasis": round(sre, 6), "glrlm_long_run_emphasis": round(lre, 6),
-                "glrlm_run_entropy": round(run_ent, 6), "glrlm_gl_non_uniformity": round(glnu, 6),
-                "glrlm_rl_non_uniformity": round(rlnu, 6), "glrlm_run_percentage": round(run_pct, 6),
+                "glrlm_run_entropy": round(run_ent, 6), "glrlm_gray_level_non_uniformity": round(glnu, 6),
+                "glrlm_run_length_non_uniformity": round(rlnu, 6), "glrlm_run_percentage": round(run_pct, 6),
                 "glrlm_srhgle": round(srhgle, 6), "glrlm_lrhgle": round(lrhgle, 6)}
 
 
@@ -5246,7 +5349,7 @@ class GLSZMFeatures(_BDTextureFeatureBase):
     def compute(self, ct_volume: np.ndarray, parenchymal_mask: np.ndarray) -> dict:
         names = {"ZoneEntropy": "glszm_zone_entropy", "SmallAreaEmphasis": "glszm_small_area_emphasis",
                  "LargeAreaEmphasis": "glszm_large_area_emphasis",
-                 "GrayLevelNonUniformity": "glszm_gl_non_uniformity",
+                 "GrayLevelNonUniformity": "glszm_gray_level_non_uniformity",
                  "ZoneSizeNonUniformity": "glszm_zone_size_non_uniformity",
                  "ZonePercentage": "glszm_zone_percentage", "SmallAreaHighGrayLevelEmphasis": "glszm_sahgle"}
         rad_out = self._pyradiomics_features(ct_volume, parenchymal_mask, "glszm", names)
@@ -5289,7 +5392,7 @@ class GLSZMFeatures(_BDTextureFeatureBase):
         g_idx_sz = np.arange(n_g, dtype=np.float64)
         sahgle = float(np.sum(glszm / (z_idx ** 2 + 1e-12) * (g_idx_sz[:, np.newaxis] ** 2))) / total
         return {"glszm_zone_entropy": round(zone_ent, 6), "glszm_small_area_emphasis": round(sae, 6),
-                "glszm_large_area_emphasis": round(lae, 6), "glszm_gl_non_uniformity": round(glnu_sz, 6),
+                "glszm_large_area_emphasis": round(lae, 6), "glszm_gray_level_non_uniformity": round(glnu_sz, 6),
                 "glszm_zone_size_non_uniformity": round(zsnu, 6), "glszm_zone_percentage": round(zone_pct, 6),
                 "glszm_sahgle": round(sahgle, 6)}
 
@@ -5336,7 +5439,7 @@ class GLDMFeatures(_BDTextureFeatureBase):
         lde = float(np.sum(dep_probs[:, 1:] * (dep_idx[1:] ** 2))) if max_dep > 1 else float("nan")
         return {"gldm_dependence_non_uniformity": round(dnu, 6), "gldm_dependence_entropy": round(dep_ent, 6),
                 "gldm_small_dependence_emphasis": round(sde, 6), "gldm_large_dependence_emphasis": round(lde, 6),
-                "gldm_gl_non_uniformity": round(glnu_gldm, 6)}
+                "gldm_gray_level_non_uniformity": round(glnu_gldm, 6)}
 
 
 class NGTDMFeatures(_BDTextureFeatureBase):
