@@ -231,7 +231,7 @@ class ShapeFeatures:
     def compute(self, parenchymal_mask: np.ndarray, voxel_spacing_mm: Tuple[float, float, float]) -> Dict[str, float]:
         """Compute volume, area, compactness, PCA axes, and geometric ratios."""
         if not np.any(parenchymal_mask):
-            return {k: 0.0 for k in [
+            return {k: float("nan") for k in [
                 "parenchymal_volume_cc", "surface_area_mm2", "surface_to_volume_ratio", "sphericity",
                 "elongation", "flatness", "max_3d_diameter_mm", "major_axis_length_mm", "minor_axis_length_mm"
             ]}
@@ -279,7 +279,7 @@ class FirstOrderFeatures:
         """Compute descriptive HU moments and histogram-derived entropy/uniformity."""
         values = ct_volume[parenchymal_mask]
         if values.size == 0:
-            return {k: 0.0 for k in [
+            return {k: float("nan") for k in [
                 "mean_hu", "median_hu", "std_hu", "percentile_10_hu", "percentile_90_hu", "iqr_hu",
                 "skewness", "kurtosis", "entropy", "uniformity"
             ]}
@@ -295,8 +295,8 @@ class FirstOrderFeatures:
             "percentile_10_hu": float(np.percentile(values, 10)),
             "percentile_90_hu": float(np.percentile(values, 90)),
             "iqr_hu": float(np.percentile(values, 75) - np.percentile(values, 25)),
-            "skewness": float(skew(values)) if values.size > 2 else 0.0,
-            "kurtosis": float(kurtosis(values)) if values.size > 3 else 0.0,
+            "skewness": float(skew(values)) if values.size > 2 else float("nan"),
+            "kurtosis": float(kurtosis(values)) if values.size > 3 else float("nan"),
             "entropy": float(scipy_entropy(probs + 1e-12, base=2)),
             "uniformity": float(np.sum(probs ** 2)),
         }
@@ -319,7 +319,7 @@ class _TextureFeatureBase:
             output = {}
             for out_name, rad_name in names.items():
                 key = f"original_{feature_class}_{rad_name}"
-                output[out_name] = float(result.get(key, 0.0))
+                output[out_name] = float(result.get(key, float("nan")))
             return output
         except Exception as exc:
             print(f"[Texture] pyradiomics backend unavailable for {feature_class}: {exc}")
@@ -417,10 +417,10 @@ class GLRLMFeatures(_TextureFeatureBase):
         max_id = int(run_id.max())
         if max_id == 0:
             return {
-                "glrlm_short_run_emphasis": 0.0,
-                "glrlm_long_run_emphasis": 0.0,
-                "glrlm_run_entropy": 0.0,
-                "glrlm_gray_level_non_uniformity": 0.0,
+                "glrlm_short_run_emphasis": float("nan"),
+                "glrlm_long_run_emphasis": float("nan"),
+                "glrlm_run_entropy": float("nan"),
+                "glrlm_gray_level_non_uniformity": float("nan"),
             }
         rids_flat = run_id.ravel()
         grays_flat = q_2d.ravel()
@@ -483,10 +483,10 @@ class GLSZMFeatures(_TextureFeatureBase):
 
         if not zones_g:
             return {
-                "glszm_small_area_emphasis": 0.0,
-                "glszm_large_area_emphasis": 0.0,
-                "glszm_zone_entropy": 0.0,
-                "glszm_gray_level_non_uniformity": 0.0,
+                "glszm_small_area_emphasis": float("nan"),
+                "glszm_large_area_emphasis": float("nan"),
+                "glszm_zone_entropy": float("nan"),
+                "glszm_gray_level_non_uniformity": float("nan"),
             }
 
         max_zone = int(max(zones_s))
@@ -561,10 +561,10 @@ class GLDMFeatures(_TextureFeatureBase):
 
         if not parenchymal_mask.any():
             return {
-                "gldm_small_dependence_emphasis": 0.0,
-                "gldm_large_dependence_emphasis": 0.0,
-                "gldm_dependence_non_uniformity": 0.0,
-                "gldm_gray_level_non_uniformity": 0.0,
+                "gldm_small_dependence_emphasis": float("nan"),
+                "gldm_large_dependence_emphasis": float("nan"),
+                "gldm_dependence_non_uniformity": float("nan"),
+                "gldm_gray_level_non_uniformity": float("nan"),
             }
         grays = q[parenchymal_mask]
         deps = dep_count[parenchymal_mask] + 1   # +1 matches original behaviour
@@ -649,7 +649,7 @@ class NGTDMFeatures(_TextureFeatureBase):
 
         total = float(np.sum(n_i))
         if total == 0:
-            return {"ngtdm_coarseness": 0.0, "ngtdm_contrast": 0.0, "ngtdm_busyness": 0.0}
+            return {"ngtdm_coarseness": float("nan"), "ngtdm_contrast": float("nan"), "ngtdm_busyness": float("nan")}
 
         p_i = n_i / total
         coarseness = _safe_div(1.0, np.sum(p_i * s_i) + 1e-8)
@@ -699,7 +699,7 @@ class ParenchymalComplexityEngine:
         for group in (shape_features, first_order, glcm, glrlm, glszm, gldm, ngtdm):
             all_features.update(group)
 
-        shortlist = {k: float(all_features.get(k, 0.0)) for k in MANUSCRIPT_SHORTLIST_FEATURES}
+        shortlist = {k: float(all_features.get(k, float("nan"))) for k in MANUSCRIPT_SHORTLIST_FEATURES}
         all_features["manuscript_shortlist"] = shortlist
         return all_features
 
@@ -800,7 +800,12 @@ class BreastDensityDialog:
 
     def export_full_report(self) -> str:
         """Export all density and complexity features to a timestamped CSV file."""
-        payload = {**self.density_results, **{k: v for k, v in self.complexity_results.items() if k != "manuscript_shortlist"}}
+        segmentation_valid = bool(self.cleaned_parenchymal_mask.any())
+        payload = {
+            "segmentation_valid": segmentation_valid,
+            **self.density_results,
+            **{k: v for k, v in self.complexity_results.items() if k != "manuscript_shortlist"},
+        }
         output = f"breast_full_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         pd.DataFrame([payload]).to_csv(output, index=False)
         print(f"[Export] Full report saved: {output}")
@@ -808,8 +813,13 @@ class BreastDensityDialog:
 
     def export_manuscript_panel(self) -> str:
         """Export only 21-feature manuscript shortlist to a timestamped CSV file."""
+        segmentation_valid = bool(self.cleaned_parenchymal_mask.any())
+        payload = {
+            "segmentation_valid": segmentation_valid,
+            **self.complexity_results["manuscript_shortlist"],
+        }
         output = f"breast_manuscript_panel_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        pd.DataFrame([self.complexity_results["manuscript_shortlist"]]).to_csv(output, index=False)
+        pd.DataFrame([payload]).to_csv(output, index=False)
         print(f"[Export] Manuscript panel saved: {output}")
         return output
 
