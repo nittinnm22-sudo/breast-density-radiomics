@@ -396,6 +396,8 @@ class SliceView(QtWidgets.QWidget):
         self.ct_wl = 40.0; self.ct_ww = 400.0; self.view_mode = 'fused'
         self.show_mask = True
         self.is_mip_active = False
+        # Segmentation overlays: dict mapping (R, G, B, A) colour tuple → 3-D bool ndarray
+        self.seg_overlays: dict = {}
         self._lut = _make_hot_iron_lut(256); self._build_ui()
 
     @property
@@ -486,6 +488,18 @@ class SliceView(QtWidgets.QWidget):
         if self.view_type == "coronal":
             return m[:, self.slice_idx]
         return m[:, :, self.slice_idx]
+
+    def set_seg_overlays(self, overlays: dict):
+        """Set colour-coded segmentation overlays for display in all three views.
+
+        Args:
+            overlays: dict mapping (R, G, B, A) colour tuples to 3-D boolean
+                      numpy arrays (same shape as the loaded CT volume).
+                      Pass an empty dict {} to clear all segmentation overlays.
+        """
+        self.seg_overlays = dict(overlays) if overlays else {}
+        if self.pet_suv is not None:
+            self.update_view()
 
     def set_mip_mode(self, active):
         if self.view_type == "coronal": self.is_mip_active = active; self.update_view()
@@ -623,8 +637,8 @@ class SliceView(QtWidgets.QWidget):
         xs, ys = [p[0] for p in pts] + [pts[0][0]], [p[1] for p in pts] + [pts[0][1]]
         z, y, x = self.current_zyx
         if self.view_type == "axial": self.mask[z, :, :] |= _polyfill_2d(self.mask.shape[1], self.mask.shape[2], xs, ys)[::-1]
-        elif self.view_type == "coronal": self.mask[:, y, :] |= _polyfill_2d(self.mask.shape[0], self.mask.shape[2], ys, xs)
-        else: self.mask[:, :, x] |= _polyfill_2d(self.mask.shape[0], self.mask.shape[1], ys, xs)
+        elif self.view_type == "coronal": self.mask[:, y, :] |= _polyfill_2d(self.mask.shape[0], self.mask.shape[2], xs, ys)
+        else: self.mask[:, :, x] |= _polyfill_2d(self.mask.shape[0], self.mask.shape[1], xs, ys)
         self._lasso_pts_px = []; self.update_view(); self.sig_mask_changed.emit()
     def update_crosshair_lines(self):
         x, y = self.voxel_to_display(self.cross_z, self.cross_y, self.cross_x)
@@ -645,6 +659,18 @@ class SliceView(QtWidgets.QWidget):
         if self.show_mask:
             h, w = m2.shape
             ov = np.zeros((h, w, 4), dtype=np.uint8)
+
+            # Segmentation overlays (breast density module) — rendered first so
+            # the primary/meta ROI markers always appear on top.
+            # Colour key: cyan = right whole-breast, steel-blue = left whole-breast,
+            #             orange = right fibroglandular, gold = left fibroglandular.
+            for (r, g, b, a), m_seg in self.seg_overlays.items():
+                try:
+                    ms = self._slice_mask(m_seg)
+                    if ms is not None and ms.shape == (h, w):
+                        ov[ms.astype(bool)] = [r, g, b, a]
+                except Exception:
+                    pass
 
             # Primary tumor mask (green)
             try:
@@ -5404,9 +5430,15 @@ class V21BreastDensityTab(QtWidgets.QWidget):
         self._btn_segment_fg.setEnabled(BREAST_DENSITY_DEPS_AVAILABLE)
         self._btn_segment_fg.setToolTip(
             "Run BreastSegmentor.segment_fibroglandular + exclude_non_parenchymal on the\n"
-            "labelled left and right breast ROIs independently.\n"
-            "Strips skin, pectoralis muscle, and metallic clips from each breast separately.\n"
-            "Requires at least one labelled breast ROI."
+            "labelled left and right breast ROIs independently.\n\n"
+            "✅ Automatic exclusions (NO extra buttons needed):\n"
+            "   • Skin shell   — 2-voxel erosion of breast boundary\n"
+            "   • Pectoralis   — posterior-region HU >40 (muscle)\n"
+            "   • Metal clips  — bright small objects HU >400\n\n"
+            "After running, colour-coded overlays appear in all three views:\n"
+            "   Cyan = right whole breast   Blue = left whole breast\n"
+            "   Orange = right fibroglandular   Gold = left fibroglandular\n\n"
+            "Requires at least one labelled breast ROI (Step 1)."
         )
         self._btn_segment_fg.clicked.connect(self._on_segment_fg)
         btn_row.addWidget(self._btn_segment_fg)
@@ -5532,6 +5564,34 @@ class V21BreastDensityTab(QtWidgets.QWidget):
             parts.append(f"🔵 LEFT   ({int(np.sum(self._roi_left))} vox)")
         self._lbl_roi_status.setText("  |  ".join(parts) if parts else "No breast ROIs labelled yet.")
 
+    def _push_seg_overlays(self):
+        """Push colour-coded segmentation masks to all three slice views.
+
+        Colour scheme:
+          🔴 RIGHT whole breast  — cyan        (R=0,   G=200, B=200, A=55)
+          🔵 LEFT  whole breast  — steel-blue  (R=70,  G=130, B=180, A=55)
+          🔴 RIGHT fibroglandular— orange      (R=255, G=140, B=0,   A=140)
+          🔵 LEFT  fibroglandular— gold        (R=220, G=200, B=0,   A=140)
+
+        Skin, pectoralis, and clip exclusions are performed automatically inside
+        BreastSegmentor.exclude_non_parenchymal() — no extra buttons are required.
+        """
+        overlays: dict = {}
+        right_whole = self._whole_masks.get("right_mask") or self._roi_right
+        left_whole = self._whole_masks.get("left_mask") or self._roi_left
+        if right_whole is not None:
+            overlays[(0, 200, 200, 55)] = right_whole       # cyan — right whole breast
+        if left_whole is not None:
+            overlays[(70, 130, 180, 55)] = left_whole       # steel-blue — left whole breast
+        if "right" in self._fg_masks:
+            overlays[(255, 140, 0, 140)] = self._fg_masks["right"]   # orange — right FG
+        if "left" in self._fg_masks:
+            overlays[(220, 200, 0, 140)] = self._fg_masks["left"]    # gold — left FG
+        for attr in ("view_ax", "view_co", "view_sa"):
+            v = getattr(self._app, attr, None)
+            if v is not None and hasattr(v, "set_seg_overlays"):
+                v.set_seg_overlays(overlays)
+
     # ------------------------------------------------------------------
     @staticmethod
     def _make_kv_table() -> QtWidgets.QTableWidget:
@@ -5591,10 +5651,16 @@ class V21BreastDensityTab(QtWidgets.QWidget):
         self._roi_right = None
         self._fg_masks = {}
         self._parenchymal_mask = None
+        self._whole_masks = {}
         self._update_roi_status()
         self._btn_complexity.setEnabled(False)
         self._btn_complexity_left.setEnabled(False)
         self._btn_complexity_right.setEnabled(False)
+        # Clear segmentation overlays from all views
+        for attr in ("view_ax", "view_co", "view_sa"):
+            v = getattr(self._app, attr, None)
+            if v is not None and hasattr(v, "set_seg_overlays"):
+                v.set_seg_overlays({})
         self._log_msg("[ROI] Left / right labels cleared.")
 
     # ------------------------------------------------------------------
@@ -5686,7 +5752,10 @@ class V21BreastDensityTab(QtWidgets.QWidget):
             self._btn_complexity_right.setEnabled(BREAST_DENSITY_DEPS_AVAILABLE and "right" in self._fg_masks)
             self._btn_complexity_left.setEnabled(BREAST_DENSITY_DEPS_AVAILABLE and "left" in self._fg_masks)
             self._btn_export.setEnabled(True)
-            self._log_msg("[FG] Done.")
+            self._push_seg_overlays()
+            self._log_msg("[FG] Done. Colour overlays: cyan=right whole, blue=left whole, "
+                          "orange=right FG, gold=left FG. "
+                          "Skin, pectoralis and clips are excluded automatically.")
         except Exception as exc:
             self._log_msg(f"[FG] ERROR: {exc}")
             QtWidgets.QMessageBox.critical(self, "FG Segmentation Error", str(exc))
@@ -5750,7 +5819,10 @@ class V21BreastDensityTab(QtWidgets.QWidget):
             self._btn_complexity_right.setEnabled(BREAST_DENSITY_DEPS_AVAILABLE)
             self._btn_complexity_left.setEnabled(BREAST_DENSITY_DEPS_AVAILABLE)
             self._btn_export.setEnabled(True)
-            self._log_msg("[Density] Done.")
+            self._push_seg_overlays()
+            self._log_msg("[Density] Done. Colour overlays: cyan=right whole, blue=left whole, "
+                          "orange=right FG, gold=left FG. "
+                          "Skin, pectoralis and clips are excluded automatically.")
         except Exception as exc:
             self._log_msg(f"[Density] ERROR: {exc}")
             QtWidgets.QMessageBox.critical(self, "Breast Density Error", str(exc))
