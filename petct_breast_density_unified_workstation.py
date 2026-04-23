@@ -146,20 +146,25 @@ class BreastSegmentor:
 
         clips = (ct_volume > HU_CLIP_MIN) & cleaned
         labels, n_labels = ndi.label(clips)
-        clip_removed = np.zeros_like(cleaned)
-        for idx in range(1, n_labels + 1):
-            cc = labels == idx
-            if np.count_nonzero(cc) <= 500:
-                clip_removed |= cc
-        removed = int(np.count_nonzero(cleaned & clip_removed))
-        cleaned &= ~clip_removed
+        if n_labels:
+            sizes = np.bincount(labels.ravel())           # sizes[i] = voxels in component i
+            small_ids = np.nonzero(sizes[1:] <= 500)[0] + 1  # 1-based label IDs ≤500 voxels
+            if small_ids.size:
+                clip_mask = np.isin(labels, small_ids)
+                removed = int(np.count_nonzero(cleaned & clip_mask))
+                cleaned &= ~clip_mask
+            else:
+                removed = 0
+        else:
+            removed = 0
         print(f"[Segmentor] excluded {removed} voxels: clips/markers")
 
         tumor_candidates = cleaned & (ct_volume > 20)
         labels, n_labels = ndi.label(tumor_candidates)
         if n_labels:
-            component_sizes = [(idx, int(np.count_nonzero(labels == idx))) for idx in range(1, n_labels + 1)]
-            largest_idx, largest_size = max(component_sizes, key=lambda x: x[1])
+            sizes = np.bincount(labels.ravel())
+            largest_idx = int(np.argmax(sizes[1:]) + 1)
+            largest_size = int(sizes[largest_idx])
             cleaned &= labels != largest_idx
             print(f"[Segmentor] excluded {largest_size} voxels: primary tumor placeholder (review advised)")
         else:
@@ -395,39 +400,39 @@ class GLRLMFeatures(_TextureFeatureBase):
             return pyr
 
         q = _prepare_quantized_volume(ct_volume, parenchymal_mask)
-        runs: List[Tuple[int, int]] = []
-        for z in range(q.shape[0]):
-            for y in range(q.shape[1]):
-                row_mask = parenchymal_mask[z, y]
-                row_vals = q[z, y]
-                idx = np.where(row_mask)[0]
-                if idx.size == 0:
-                    continue
-                start = idx[0]
-                prev = row_vals[start]
-                length = 1
-                for x in idx[1:]:
-                    if x == start + length and row_vals[x] == prev:
-                        length += 1
-                    else:
-                        runs.append((int(prev), int(length)))
-                        start = x
-                        prev = row_vals[x]
-                        length = 1
-                runs.append((int(prev), int(length)))
-
-        if not runs:
+        # Vectorised run-length encoding along the x-axis (axis 2).
+        n_g = VOXEL_BINS
+        max_run = max(ct_volume.shape)
+        rlm = np.zeros((n_g, max_run + 1), dtype=np.float64)
+        Z, Y, X = q.shape
+        q_2d = q.reshape(-1, X)
+        m_2d = parenchymal_mask.reshape(-1, X)
+        prev_m = np.zeros_like(m_2d)
+        prev_m[:, 1:] = m_2d[:, :-1]
+        prev_q = np.zeros_like(q_2d)
+        prev_q[:, 1:] = q_2d[:, :-1]
+        is_start = m_2d & (~prev_m | (q_2d != prev_q))
+        run_id = np.cumsum(is_start.ravel()).reshape(Z * Y, X)
+        run_id = np.where(m_2d, run_id, 0)
+        max_id = int(run_id.max())
+        if max_id == 0:
             return {
                 "glrlm_short_run_emphasis": 0.0,
                 "glrlm_long_run_emphasis": 0.0,
                 "glrlm_run_entropy": 0.0,
                 "glrlm_gray_level_non_uniformity": 0.0,
             }
-
-        max_run = max(length for _, length in runs)
-        rlm = np.zeros((VOXEL_BINS, max_run + 1), dtype=np.float64)
-        for g, r in runs:
-            rlm[g, r] += 1
+        rids_flat = run_id.ravel()
+        grays_flat = q_2d.ravel()
+        mask_flat = m_2d.ravel()
+        masked_rids = rids_flat[mask_flat]
+        masked_grays = grays_flat[mask_flat]
+        rl = np.bincount(masked_rids, minlength=max_id + 1)[1:]
+        gl = np.zeros(max_id + 1, dtype=q_2d.dtype)
+        np.maximum.at(gl, masked_rids, masked_grays)
+        gl = gl[1:]
+        valid = (gl >= 0) & (gl < n_g) & (rl >= 1) & (rl <= max_run)
+        np.add.at(rlm, (gl[valid], rl[valid]), 1)
         p = rlm / max(rlm.sum(), 1.0)
         run_lengths = np.arange(p.shape[1], dtype=np.float64)
 
@@ -463,15 +468,20 @@ class GLSZMFeatures(_TextureFeatureBase):
             return pyr
 
         q = _prepare_quantized_volume(ct_volume, parenchymal_mask)
-        zones: List[Tuple[int, int]] = []
         structure = np.ones((3, 3, 3), dtype=np.uint8)
+        # Vectorised: for each gray level, label connected components then get sizes
+        # via bincount — avoids the O(n_labels × volume_size) loop per component.
+        zones_g: list = []
+        zones_s: list = []
         for g in range(VOXEL_BINS):
             level_mask = parenchymal_mask & (q == g)
             labels, n_labels = ndi.label(level_mask, structure=structure)
-            for idx in range(1, n_labels + 1):
-                zones.append((g, int(np.count_nonzero(labels == idx))))
+            if n_labels:
+                sizes = np.bincount(labels.ravel())[1:]   # voxel count per component
+                zones_g.extend([g] * n_labels)
+                zones_s.extend(sizes.tolist())
 
-        if not zones:
+        if not zones_g:
             return {
                 "glszm_small_area_emphasis": 0.0,
                 "glszm_large_area_emphasis": 0.0,
@@ -479,10 +489,11 @@ class GLSZMFeatures(_TextureFeatureBase):
                 "glszm_gray_level_non_uniformity": 0.0,
             }
 
-        max_zone = max(size for _, size in zones)
+        max_zone = int(max(zones_s))
+        zones_g_arr = np.array(zones_g, dtype=np.int64)
+        zones_s_arr = np.array(zones_s, dtype=np.int64)
         szm = np.zeros((VOXEL_BINS, max_zone + 1), dtype=np.float64)
-        for g, s in zones:
-            szm[g, s] += 1
+        np.add.at(szm, (zones_g_arr, zones_s_arr), 1)
 
         p = szm / max(szm.sum(), 1.0)
         sizes = np.arange(p.shape[1], dtype=np.float64)
@@ -518,37 +529,49 @@ class GLDMFeatures(_TextureFeatureBase):
             return pyr
 
         q = _prepare_quantized_volume(ct_volume, parenchymal_mask)
-        dep_records: List[Tuple[int, int]] = []
-        neighbors = [
+        # Vectorised: count same-gray (within ±1 bin) neighbours using 26-connected
+        # shifted copies, avoiding the O(n_voxels × 26) Python loop.
+        dep_count = np.zeros(q.shape, dtype=np.int32)
+        all_offsets_3d = [
             (dz, dy, dx)
             for dz in (-1, 0, 1)
             for dy in (-1, 0, 1)
             for dx in (-1, 0, 1)
             if not (dz == dy == dx == 0)
         ]
+        q_int = q.astype(np.int32)
+        for dz, dy, dx in all_offsets_3d:
+            shifted_q = np.roll(np.roll(np.roll(q_int, -dz, axis=0), -dy, axis=1), -dx, axis=2)
+            shifted_m = np.roll(np.roll(np.roll(parenchymal_mask, -dz, axis=0), -dy, axis=1), -dx, axis=2)
+            # Clear wrapped boundaries for all three axes.
+            if dz > 0:
+                shifted_m[:dz] = False
+            elif dz < 0:
+                shifted_m[dz:] = False
+            if dy > 0:
+                shifted_m[:, :dy] = False
+            elif dy < 0:
+                shifted_m[:, dy:] = False
+            if dx > 0:
+                shifted_m[:, :, :dx] = False
+            elif dx < 0:
+                shifted_m[:, :, dx:] = False
+            same_gray = parenchymal_mask & shifted_m & (np.abs(q_int - shifted_q) <= 1)
+            dep_count += same_gray.astype(np.int32)
 
-        for z, y, x in np.argwhere(parenchymal_mask):
-            center = q[z, y, x]
-            dep = 0
-            for dz, dy, dx in neighbors:
-                zz, yy, xx = z + dz, y + dy, x + dx
-                if 0 <= zz < q.shape[0] and 0 <= yy < q.shape[1] and 0 <= xx < q.shape[2]:
-                    if parenchymal_mask[zz, yy, xx] and abs(int(q[zz, yy, xx]) - int(center)) <= 1:
-                        dep += 1
-            dep_records.append((int(center), dep + 1))
-
-        if not dep_records:
+        if not parenchymal_mask.any():
             return {
                 "gldm_small_dependence_emphasis": 0.0,
                 "gldm_large_dependence_emphasis": 0.0,
                 "gldm_dependence_non_uniformity": 0.0,
                 "gldm_gray_level_non_uniformity": 0.0,
             }
-
-        max_dep = max(dep for _, dep in dep_records)
+        grays = q[parenchymal_mask]
+        deps = dep_count[parenchymal_mask] + 1   # +1 matches original behaviour
+        max_dep = int(deps.max())
         gldm = np.zeros((VOXEL_BINS, max_dep + 1), dtype=np.float64)
-        for g, d in dep_records:
-            gldm[g, d] += 1
+        valid = (grays >= 0) & (grays < VOXEL_BINS)
+        np.add.at(gldm, (grays[valid], deps[valid]), 1)
 
         p = gldm / max(gldm.sum(), 1.0)
         deps = np.arange(p.shape[1], dtype=np.float64)
@@ -586,25 +609,43 @@ class NGTDMFeatures(_TextureFeatureBase):
         s_i = np.zeros(VOXEL_BINS, dtype=np.float64)
         n_i = np.zeros(VOXEL_BINS, dtype=np.float64)
 
-        neighbors = [
+        # Vectorised: accumulate neighbour sums/counts with 26 shifted copies.
+        all_offsets_3d = [
             (dz, dy, dx)
             for dz in (-1, 0, 1)
             for dy in (-1, 0, 1)
             for dx in (-1, 0, 1)
             if not (dz == dy == dx == 0)
         ]
-
-        for z, y, x in np.argwhere(parenchymal_mask):
-            g = int(q[z, y, x])
-            neigh_vals = []
-            for dz, dy, dx in neighbors:
-                zz, yy, xx = z + dz, y + dy, x + dx
-                if 0 <= zz < q.shape[0] and 0 <= yy < q.shape[1] and 0 <= xx < q.shape[2] and parenchymal_mask[zz, yy, xx]:
-                    neigh_vals.append(int(q[zz, yy, xx]))
-            if neigh_vals:
-                avg = float(np.mean(neigh_vals))
-                s_i[g] += abs(g - avg)
-                n_i[g] += 1
+        neighbour_sum = np.zeros(q.shape, dtype=np.float64)
+        neighbour_cnt = np.zeros(q.shape, dtype=np.float64)
+        q_float = q.astype(np.float64)
+        for dz, dy, dx in all_offsets_3d:
+            shifted_q = np.roll(np.roll(np.roll(q_float, -dz, axis=0), -dy, axis=1), -dx, axis=2)
+            shifted_m = np.roll(np.roll(np.roll(parenchymal_mask, -dz, axis=0), -dy, axis=1), -dx, axis=2)
+            if dz > 0:
+                shifted_m[:dz] = False
+            elif dz < 0:
+                shifted_m[dz:] = False
+            if dy > 0:
+                shifted_m[:, :dy] = False
+            elif dy < 0:
+                shifted_m[:, dy:] = False
+            if dx > 0:
+                shifted_m[:, :, :dx] = False
+            elif dx < 0:
+                shifted_m[:, :, dx:] = False
+            valid_nb = parenchymal_mask & shifted_m
+            neighbour_sum += np.where(valid_nb, shifted_q, 0.0)
+            neighbour_cnt += valid_nb.astype(np.float64)
+        has_nb = parenchymal_mask & (neighbour_cnt > 0)
+        if has_nb.any():
+            grays = q[has_nb]
+            avg_nb = neighbour_sum[has_nb] / neighbour_cnt[has_nb]
+            diffs = np.abs(grays.astype(np.float64) - avg_nb)
+            valid = (grays >= 0) & (grays < VOXEL_BINS)
+            np.add.at(n_i, grays[valid], 1.0)
+            np.add.at(s_i, grays[valid], diffs[valid])
 
         total = float(np.sum(n_i))
         if total == 0:
