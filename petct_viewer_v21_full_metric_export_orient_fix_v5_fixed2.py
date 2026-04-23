@@ -5405,9 +5405,10 @@ class V21BreastDensityTab(QtWidgets.QWidget):
         self._whole_masks: dict = {}          # keyed "left_mask" / "right_mask"
         self._fg_masks: dict = {}             # fibroglandular masks per side after segmentation
         self._parenchymal_mask = None         # active mask fed to complexity engine
-        self._roi_left: Optional[np.ndarray] = None    # manually labelled left breast ROI
-        self._roi_right: Optional[np.ndarray] = None   # manually labelled right breast ROI
-        self._worker: Optional[_BreastWorker] = None   # background computation thread
+        self._roi_left: Optional[np.ndarray] = None           # manually labelled left breast ROI
+        self._roi_right: Optional[np.ndarray] = None          # manually labelled right breast ROI
+        self._roi_tumor_exclusion: Optional[np.ndarray] = None  # user-drawn tumor exclusion ROI
+        self._worker: Optional[_BreastWorker] = None          # background computation thread
         self._build()
 
     # ------------------------------------------------------------------
@@ -5470,6 +5471,32 @@ class V21BreastDensityTab(QtWidgets.QWidget):
         self._lbl_roi_status = QtWidgets.QLabel("No breast ROIs labelled yet.")
         self._lbl_roi_status.setStyleSheet("color: #5d6d7e; font-style: italic;")
         label_lay.addWidget(self._lbl_roi_status)
+
+        # ── Tumor exclusion ROI row (within Step 1) ─────────────────────
+        tumor_row = QtWidgets.QHBoxLayout()
+
+        self._btn_label_tumor_excl = QtWidgets.QPushButton("🚫  Mark Tumor Exclusion ROI")
+        self._btn_label_tumor_excl.setToolTip(
+            "Draw the tumor region in the main viewer using Paint or Lasso, then click this button.\n"
+            "The drawn region will be subtracted from the fibroglandular mask before density computation.\n\n"
+            "This is applied on top of the automatic largest-component heuristic already built in to\n"
+            "'Segment Fibroglandular Tissue' and 'Compute Density (Auto)'."
+        )
+        self._btn_label_tumor_excl.setStyleSheet("QPushButton { color: #6c3483; font-weight: bold; }")
+        self._btn_label_tumor_excl.clicked.connect(self._on_label_tumor_exclusion)
+        tumor_row.addWidget(self._btn_label_tumor_excl)
+
+        self._btn_clear_tumor_excl = QtWidgets.QPushButton("✖  Clear Tumor Exclusion")
+        self._btn_clear_tumor_excl.setToolTip("Remove the stored tumor exclusion ROI.")
+        self._btn_clear_tumor_excl.clicked.connect(self._on_clear_tumor_exclusion)
+        tumor_row.addWidget(self._btn_clear_tumor_excl)
+        tumor_row.addStretch()
+        label_lay.addLayout(tumor_row)
+
+        self._lbl_tumor_excl_status = QtWidgets.QLabel("No tumor exclusion ROI set.")
+        self._lbl_tumor_excl_status.setStyleSheet("color: #6c3483; font-style: italic;")
+        label_lay.addWidget(self._lbl_tumor_excl_status)
+
         root.addWidget(label_grp)
 
         # ── Segmentation / density row ──────────────────────────────────
@@ -5643,6 +5670,11 @@ class V21BreastDensityTab(QtWidgets.QWidget):
         if self._roi_left is not None:
             parts.append(f"🔵 LEFT   ({int(np.sum(self._roi_left))} vox)")
         self._lbl_roi_status.setText("  |  ".join(parts) if parts else "No breast ROIs labelled yet.")
+        if self._roi_tumor_exclusion is not None:
+            n = int(np.sum(self._roi_tumor_exclusion))
+            self._lbl_tumor_excl_status.setText(f"🚫 Tumor exclusion ROI set  ({n} vox) — will be subtracted from FG mask")
+        else:
+            self._lbl_tumor_excl_status.setText("No tumor exclusion ROI set.")
 
     def _push_seg_overlays(self):
         """Push colour-coded segmentation masks to all three slice views.
@@ -5667,6 +5699,8 @@ class V21BreastDensityTab(QtWidgets.QWidget):
             overlays[(255, 140, 0, 140)] = self._fg_masks["right"]   # orange — right FG
         if "left" in self._fg_masks:
             overlays[(220, 200, 0, 140)] = self._fg_masks["left"]    # gold — left FG
+        if self._roi_tumor_exclusion is not None:
+            overlays[(220, 30, 30, 160)] = self._roi_tumor_exclusion  # red — tumor exclusion zone
         for attr in ("view_ax", "view_co", "view_sa"):
             v = getattr(self._app, attr, None)
             if v is not None and hasattr(v, "set_seg_overlays"):
@@ -5743,6 +5777,31 @@ class V21BreastDensityTab(QtWidgets.QWidget):
                 v.set_seg_overlays({})
         self._log_msg("[ROI] Left / right labels cleared.")
 
+    def _on_label_tumor_exclusion(self):
+        """Snapshot the current viewer ROI mask as the tumor exclusion zone."""
+        roi_mask = getattr(self._app, "mask_primary", None)
+        if roi_mask is None:
+            roi_mask = getattr(self._app, "mask", None)
+        if roi_mask is None or not np.any(roi_mask):
+            QtWidgets.QMessageBox.warning(
+                self, "Tumor Exclusion ROI",
+                "No ROI drawn in the main viewer yet.\n\n"
+                "Switch to Paint or Lasso mode, draw the tumor region, then click this button."
+            )
+            return
+        snap = roi_mask.astype(bool).copy()
+        self._roi_tumor_exclusion = snap
+        self._log_msg(f"[ROI] Tumor exclusion ROI set — {int(np.sum(snap))} voxels will be subtracted from FG mask.")
+        self._update_roi_status()
+        self._push_seg_overlays()
+
+    def _on_clear_tumor_exclusion(self):
+        """Remove the stored tumor exclusion ROI."""
+        self._roi_tumor_exclusion = None
+        self._update_roi_status()
+        self._push_seg_overlays()
+        self._log_msg("[ROI] Tumor exclusion ROI cleared.")
+
     # ------------------------------------------------------------------
     # Fibroglandular segmentation on per-breast ROIs
     # ------------------------------------------------------------------
@@ -5766,6 +5825,7 @@ class V21BreastDensityTab(QtWidgets.QWidget):
         # Snapshot ROI references before launching thread (they must not change mid-run)
         roi_right = self._roi_right.copy() if self._roi_right is not None else None
         roi_left = self._roi_left.copy() if self._roi_left is not None else None
+        tumor_excl = self._roi_tumor_exclusion.copy() if self._roi_tumor_exclusion is not None else None
         ct_snap = ct_hu.copy()
 
         def _compute():
@@ -5781,6 +5841,9 @@ class V21BreastDensityTab(QtWidgets.QWidget):
                 # Intersect with the drawn ROI so the cleaned fibroglandular mask
                 # never extends beyond the manually defined breast boundary.
                 fg_clean = fg_clean & roi
+                # Apply optional user-drawn tumor exclusion zone
+                if tumor_excl is not None:
+                    fg_clean = fg_clean & ~tumor_excl
                 fg_vol_cc = float(np.sum(fg_clean)) * vox_cc
                 fat_vol_cc = max(0.0, whole_vol_cc - fg_vol_cc)
                 fg_masks[side] = fg_clean
@@ -5855,6 +5918,7 @@ class V21BreastDensityTab(QtWidgets.QWidget):
         spacing = getattr(self._app, "spacing_zyx", (1.0, 1.0, 1.0))
         voxel_spacing_mm = (float(spacing[0]), float(spacing[1]), float(spacing[2]))
         ct_snap = ct_hu.copy()
+        tumor_excl = self._roi_tumor_exclusion.copy() if self._roi_tumor_exclusion is not None else None
 
         def _compute():
             segmentor = BreastSegmentor()
@@ -5866,6 +5930,9 @@ class V21BreastDensityTab(QtWidgets.QWidget):
                 breast_mask = whole_masks[f"{side}_mask"]
                 fg_raw = segmentor.segment_fibroglandular(ct_snap, breast_mask)
                 fg_clean = segmentor.exclude_non_parenchymal(fg_raw, ct_snap)
+                # Apply optional user-drawn tumor exclusion zone
+                if tumor_excl is not None:
+                    fg_clean = fg_clean & ~tumor_excl
                 fg_masks[side] = fg_clean
                 whole_vol_cc = float(np.sum(breast_mask)) * vox_cc
                 fg_vol_cc = float(np.sum(fg_clean)) * vox_cc
