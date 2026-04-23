@@ -39,30 +39,67 @@ HU_BREAST_MIN = -300
 HU_BREAST_MAX = 200
 HU_MUSCLE_MIN = 40
 HU_CLIP_MIN = 400
-VOXEL_BINS = 32
+# IBSI-recommended fixed bin width for CT radiomics (HU units).
+# VOXEL_BINS is derived so each bin spans exactly IBSI_BIN_WIDTH_HU Hounsfield units
+# across the breast tissue range [HU_BREAST_MIN, HU_BREAST_MAX].
+IBSI_BIN_WIDTH_HU = 25
+VOXEL_BINS = int(np.ceil((HU_BREAST_MAX - HU_BREAST_MIN) / IBSI_BIN_WIDTH_HU))  # = 20
 
+# Full 45-feature protocol panel (IBSI-aligned prespecified complexity set).
+# Shape (9), FirstOrder (10), GLCM (6), GLRLM (5), GLSZM (5), GLDM (5), NGTDM (5).
 MANUSCRIPT_SHORTLIST_FEATURES = [
+    # Shape
+    "parenchymal_volume_cc",
+    "surface_area_mm2",
     "surface_to_volume_ratio",
     "sphericity",
+    "max_3d_diameter_mm",
+    "major_axis_length_mm",
+    "minor_axis_length_mm",
     "elongation",
     "flatness",
-    "std_hu",
+    # First-order
+    "mean_hu",
+    "median_hu",
+    "percentile_10_hu",
+    "percentile_90_hu",
+    "iqr_hu",
+    "variance_hu",
     "skewness",
     "kurtosis",
     "entropy",
     "uniformity",
+    # GLCM
+    "glcm_joint_entropy",
     "glcm_contrast",
     "glcm_correlation",
-    "glcm_joint_entropy",
+    "glcm_difference_entropy",
+    "glcm_idm",
+    "glcm_imc1",
+    # GLRLM
+    "glrlm_run_entropy",
+    "glrlm_gray_level_non_uniformity",
+    "glrlm_run_length_non_uniformity",
     "glrlm_short_run_emphasis",
     "glrlm_long_run_emphasis",
-    "glrlm_run_entropy",
+    # GLSZM
     "glszm_zone_entropy",
+    "glszm_gray_level_non_uniformity",
+    "glszm_zone_size_non_uniformity",
     "glszm_small_area_emphasis",
     "glszm_large_area_emphasis",
+    # GLDM
+    "gldm_dependence_entropy",
     "gldm_dependence_non_uniformity",
+    "gldm_small_dependence_emphasis",
+    "gldm_large_dependence_emphasis",
+    "gldm_gray_level_non_uniformity",
+    # NGTDM
     "ngtdm_coarseness",
     "ngtdm_busyness",
+    "ngtdm_complexity",
+    "ngtdm_contrast",
+    "ngtdm_strength",
 ]
 
 try:
@@ -85,10 +122,15 @@ def _voxel_volume_cc(voxel_spacing_mm: Tuple[float, float, float]) -> float:
 
 
 def _prepare_quantized_volume(ct_volume: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """Clip HU and quantize masked voxels into VOXEL_BINS bins."""
+    """Clip HU and quantize masked voxels using fixed IBSI_BIN_WIDTH_HU bin width.
+
+    Fixed-bin-width discretization (IBSI recommendation for CT) ensures features
+    are comparable across patients regardless of individual ROI intensity ranges.
+    Each bin spans exactly IBSI_BIN_WIDTH_HU = 25 HU.
+    """
     clipped = np.clip(ct_volume, HU_BREAST_MIN, HU_BREAST_MAX)
-    normalized = (clipped - HU_BREAST_MIN) / (HU_BREAST_MAX - HU_BREAST_MIN + 1e-8)
-    quantized = np.floor(normalized * (VOXEL_BINS - 1)).astype(np.int32)
+    quantized = np.floor((clipped - HU_BREAST_MIN) / IBSI_BIN_WIDTH_HU).astype(np.int32)
+    quantized = np.clip(quantized, 0, VOXEL_BINS - 1)
     quantized[~mask] = 0
     return quantized
 
@@ -212,13 +254,15 @@ class BreastCTDensityEngine:
         combined_total = right_total + left_total
         bilateral_density = _safe_div(combined_fg * 100.0, combined_total)
 
+        right_d = right["right_volumetric_density_pct"]
+        left_d = left["left_volumetric_density_pct"]
+        mean_d = (right_d + left_d) / 2.0
         return {
             **right,
             **left,
             "bilateral_density_pct": bilateral_density,
-            "density_asymmetry_pct": abs(
-                right["right_volumetric_density_pct"] - left["left_volumetric_density_pct"]
-            ),
+            "density_asymmetry_pct": abs(right_d - left_d),
+            "density_asymmetry_rel_pct": _safe_div(abs(right_d - left_d) * 100.0, mean_d),
             "fibroglandular_volume_asymmetry_cc": abs(right_fg - left_fg),
             "absolute_fibroglandular_volume_cc": combined_fg,
         }
@@ -280,7 +324,8 @@ class FirstOrderFeatures:
         values = ct_volume[parenchymal_mask]
         if values.size == 0:
             return {k: float("nan") for k in [
-                "mean_hu", "median_hu", "std_hu", "percentile_10_hu", "percentile_90_hu", "iqr_hu",
+                "mean_hu", "median_hu", "std_hu", "variance_hu",
+                "percentile_10_hu", "percentile_90_hu", "iqr_hu",
                 "skewness", "kurtosis", "entropy", "uniformity"
             ]}
 
@@ -292,6 +337,7 @@ class FirstOrderFeatures:
             "mean_hu": float(np.mean(values)),
             "median_hu": float(np.median(values)),
             "std_hu": float(np.std(values)),
+            "variance_hu": float(np.var(values)),
             "percentile_10_hu": float(np.percentile(values, 10)),
             "percentile_90_hu": float(np.percentile(values, 90)),
             "iqr_hu": float(np.percentile(values, 75) - np.percentile(values, 25)),
@@ -312,9 +358,22 @@ class _TextureFeatureBase:
         try:
             image = sitk.GetImageFromArray(ct_volume.astype(np.float32))
             image_mask = sitk.GetImageFromArray(mask.astype(np.uint8))
-            extractor = featureextractor.RadiomicsFeatureExtractor(binCount=VOXEL_BINS)
+            # IBSI-compliant extractor settings for CT parenchymal radiomics.
+            # Fixed bin width (not bin count) for cross-patient reproducibility.
+            extractor = featureextractor.RadiomicsFeatureExtractor(
+                binWidth=IBSI_BIN_WIDTH_HU,
+                voxelArrayShift=0,
+                normalize=False,
+                force2D=False,
+                resampledPixelSpacing=[1.2, 1.2, 1.2],
+                interpolator="sitkBSpline",
+                padDistance=5,
+                correctMask=True,
+                label=1,
+            )
             extractor.disableAllFeatures()
-            extractor.enableFeatureClassByName(feature_class)
+            # Enable only the prespecified protocol features (locked panel).
+            extractor.enableFeaturesByName(**{feature_class: list(names.values())})
             result = extractor.execute(image, image_mask)
             output = {}
             for out_name, rad_name in names.items():
@@ -335,6 +394,7 @@ class GLCMFeatures(_TextureFeatureBase):
             "glcm_contrast", "glcm_correlation", "glcm_joint_entropy", "glcm_joint_energy",
             "glcm_homogeneity", "glcm_inverse_difference", "glcm_cluster_shade",
             "glcm_cluster_prominence", "glcm_mcc", "glcm_diff_variance", "glcm_sum_entropy",
+            "glcm_difference_entropy", "glcm_idm", "glcm_imc1",
         ]}
         if not np.any(parenchymal_mask):
             return _glcm_nan
@@ -346,6 +406,9 @@ class GLCMFeatures(_TextureFeatureBase):
                 "glcm_contrast": "Contrast",
                 "glcm_correlation": "Correlation",
                 "glcm_joint_entropy": "JointEntropy",
+                "glcm_difference_entropy": "DifferenceEntropy",
+                "glcm_idm": "Idm",
+                "glcm_imc1": "Imc1",
                 "glcm_inverse_difference": "Id",
             },
         )
@@ -406,18 +469,31 @@ class GLCMFeatures(_TextureFeatureBase):
         eigvals_mcc = np.sort(np.real(np.linalg.eigvals(q_mcc)))[::-1]
         mcc = float(np.sqrt(max(eigvals_mcc[1], 0.0))) if len(eigvals_mcc) > 1 else float("nan")
 
+        # DifferenceEntropy: -sum(p_xmy * log2(p_xmy))
+        diff_entropy = float(-np.sum(p_xmy * np.log2(p_xmy + 1e-12)))
+
+        # Imc1: (HXY - HXY1) / max(HX, HY)
+        hx = float(-np.sum(p_x * np.log2(p_x + 1e-12)))
+        hy = float(-np.sum(p_y * np.log2(p_y + 1e-12)))
+        hxy = float(-np.sum(p * np.log2(p + 1e-12)))
+        hxy1 = float(-np.sum(p * np.log2(p_x[:, np.newaxis] * p_y[np.newaxis, :] + 1e-12)))
+        imc1 = _safe_div(hxy - hxy1, max(hx, hy))
+
         return {
             "glcm_contrast": float(np.sum(((ii - jj) ** 2) * p)),
             "glcm_correlation": float(correlation),
             "glcm_joint_entropy": float(-np.sum(p * np.log2(p + 1e-12))),
             "glcm_joint_energy": float(np.sum(p ** 2)),
             "glcm_homogeneity": float(np.sum(p / (1.0 + (ii - jj) ** 2))),
+            "glcm_idm": float(np.sum(p / (1.0 + (ii - jj) ** 2))),
             "glcm_inverse_difference": float(np.sum(p / (1.0 + np.abs(ii - jj)))),
             "glcm_cluster_shade": float(np.sum(((ii + jj - mu_i - mu_j) ** 3) * p)),
             "glcm_cluster_prominence": float(np.sum(((ii + jj - mu_i - mu_j) ** 4) * p)),
             "glcm_mcc": mcc,
             "glcm_diff_variance": diff_variance,
             "glcm_sum_entropy": sum_entropy,
+            "glcm_difference_entropy": diff_entropy,
+            "glcm_imc1": float(imc1),
         }
 
 
@@ -435,6 +511,7 @@ class GLRLMFeatures(_TextureFeatureBase):
                 "glrlm_long_run_emphasis": "LongRunEmphasis",
                 "glrlm_run_entropy": "RunEntropy",
                 "glrlm_gray_level_non_uniformity": "GrayLevelNonUniformity",
+                "glrlm_run_length_non_uniformity": "RunLengthNonUniformity",
             },
         )
         if pyr:
@@ -521,6 +598,7 @@ class GLSZMFeatures(_TextureFeatureBase):
                 "glszm_large_area_emphasis": "LargeAreaEmphasis",
                 "glszm_zone_entropy": "ZoneEntropy",
                 "glszm_gray_level_non_uniformity": "GrayLevelNonUniformity",
+                "glszm_zone_size_non_uniformity": "SizeZoneNonUniformity",
             },
         )
         if pyr:
@@ -594,6 +672,7 @@ class GLDMFeatures(_TextureFeatureBase):
                 "gldm_large_dependence_emphasis": "LargeDependenceEmphasis",
                 "gldm_dependence_non_uniformity": "DependenceNonUniformity",
                 "gldm_gray_level_non_uniformity": "GrayLevelNonUniformity",
+                "gldm_dependence_entropy": "DependenceEntropy",
             },
         )
         if pyr:
@@ -650,11 +729,13 @@ class GLDMFeatures(_TextureFeatureBase):
         lde = float(np.sum(p[:, 1:] * (deps[1:] ** 2)))
         dnu = float(np.sum(np.sum(gldm, axis=0) ** 2) / max(gldm.sum(), 1.0))
         glnu = float(np.sum(np.sum(gldm, axis=1) ** 2) / max(gldm.sum(), 1.0))
+        dep_entropy = float(-np.sum(p[p > 0] * np.log2(p[p > 0])))
         return {
             "gldm_small_dependence_emphasis": sde,
             "gldm_large_dependence_emphasis": lde,
             "gldm_dependence_non_uniformity": dnu,
             "gldm_gray_level_non_uniformity": glnu,
+            "gldm_dependence_entropy": dep_entropy,
         }
 
 
@@ -671,6 +752,8 @@ class NGTDMFeatures(_TextureFeatureBase):
                 "ngtdm_coarseness": "Coarseness",
                 "ngtdm_contrast": "Contrast",
                 "ngtdm_busyness": "Busyness",
+                "ngtdm_complexity": "Complexity",
+                "ngtdm_strength": "Strength",
             },
         )
         if pyr:
