@@ -4933,21 +4933,169 @@ def _bd_prepare_quantized_volume(ct_volume: np.ndarray, mask: np.ndarray) -> np.
     return quantized
 
 
+# --- Segmentation helpers ---
+def _bd_detect_thorax_z_range(ct_volume: np.ndarray) -> tuple:
+    """Estimate the Z-slice range covering the thorax (chest), excluding abdomen.
+
+    Strategy:
+    1. Find the body outline by thresholding air (HU < -500).
+    2. Detect the diaphragm as the inferior boundary of the lung fields using the
+       per-slice fraction of lung-equivalent voxels (HU -950 to -200).
+       The diaphragm is where the lung fraction drops sharply.
+    3. Return (z_top, z_diaphragm) so the caller can crop to thorax slices only.
+
+    Falls back to the top half of the volume if detection is unreliable.
+    """
+    nz = ct_volume.shape[0]
+    lung_hu_min, lung_hu_max = -950, -200
+
+    # Per-slice lung voxel fraction (lung is very low HU)
+    lung_frac = np.array([
+        float(np.mean((ct_volume[z] >= lung_hu_min) & (ct_volume[z] <= lung_hu_max)))
+        for z in range(nz)
+    ])
+
+    # Smooth with a small window to reduce noise
+    kernel = np.ones(5, dtype=np.float64) / 5.0
+    lung_frac_smooth = np.convolve(lung_frac, kernel, mode="same")
+
+    # Find slices where lungs are present (threshold: >2% lung pixels in slice)
+    lung_present = lung_frac_smooth > 0.02
+    lung_z = np.where(lung_present)[0]
+
+    if lung_z.size < 5:
+        # No clear lung signal — fall back to top 50% of volume
+        return 0, nz // 2
+
+    z_top = int(lung_z[0])
+    z_lung_end = int(lung_z[-1])  # last slice still showing lung (inferior)
+
+    # Diaphragm is approximately at z_lung_end (lung disappears below it).
+    # Add a small margin (5 slices) to capture the full inferior breast.
+    z_diaphragm = min(z_lung_end + 5, nz - 1)
+
+    return z_top, z_diaphragm
+
+
+def _bd_get_body_outline(ct_volume: np.ndarray) -> np.ndarray:
+    """Return a 3-D boolean mask covering the patient body (excluding table/air).
+
+    Air outside the patient has HU < -500. Filling the background gives the body.
+    The table is handled by taking the largest connected component of non-air voxels.
+    """
+    body = ct_volume > -500  # non-air
+    body = _bd_binary_closing(body, footprint=np.ones((3, 3, 3)))
+    # Keep largest connected component = body (excludes small noise islands)
+    try:
+        labeled, n = _bd_ndi.label(body)
+        if n > 0:
+            sizes = np.bincount(labeled.ravel())
+            sizes[0] = 0  # background
+            largest = int(np.argmax(sizes))
+            body = labeled == largest
+    except Exception:
+        pass
+    return body.astype(bool)
+
+
 # --- Segmentation ---
 class BreastSegmentor:
-    """Performs whole-breast and fibroglandular segmentation on CT volumes."""
+    """Performs whole-breast and fibroglandular segmentation on CT volumes.
 
-    def segment_whole_breast(self, ct_volume: np.ndarray) -> dict:
-        breast = (ct_volume >= _BD_HU_BREAST_MIN) & (ct_volume <= _BD_HU_BREAST_MAX)
+    Anatomical constraints applied to avoid liver/spleen/vertebrae false-positives:
+
+    1. **Z-range (superior–inferior)**: segmentation is restricted to the thorax
+       by detecting the diaphragm (inferior boundary of the lung fields).
+       Everything below the diaphragm is excluded.
+    2. **Anterior crop (A–P direction)**: breasts are anterior structures.
+       The posterior 40 % of the AP depth (Y-axis) is excluded before any
+       HU-based thresholding. This eliminates spine, vertebrae, and posterior
+       chest-wall structures.
+    3. **Body outline**: an air-threshold body mask is used to exclude the CT
+       table and out-of-body noise.
+    4. **Left/Right split**: the midline split is along the X-axis (columns)
+       which corresponds to patient left/right in standard axial CT orientation.
+    """
+
+    # Fraction of the AP (Y) depth to keep as the anterior breast region.
+    # 0.55 means the anterior 55 % of AP depth; posterior 45 % is excluded.
+    _ANTERIOR_FRACTION = 0.55
+
+    def _breast_roi_mask(self, ct_volume: np.ndarray) -> np.ndarray:
+        """Build a 3-D Boolean mask restricting analysis to the anterior thorax.
+
+        Combines:
+          * Z range  — thorax only (lungs detected; below diaphragm excluded)
+          * Y range  — anterior fraction only (eliminates spine/posterior structures)
+          * Body outline — exclude air / CT table
+        """
+        nz, ny, nx = ct_volume.shape
+
+        # 1. Detect thorax Z range
+        try:
+            z_top, z_diaph = _bd_detect_thorax_z_range(ct_volume)
+        except Exception:
+            z_top, z_diaph = 0, nz // 2
+
+        # 2. Anterior crop: keep only the anterior fraction of AP (Y) depth
+        y_end = max(1, int(ny * self._ANTERIOR_FRACTION))
+
+        # 3. Body outline to exclude air and table
+        try:
+            body = _bd_get_body_outline(ct_volume)
+        except Exception:
+            body = ct_volume > -500
+
+        # Combine: thorax Z slices × anterior Y × body mask
+        roi = np.zeros((nz, ny, nx), dtype=bool)
+        roi[z_top:z_diaph + 1, :y_end, :] = True
+        roi &= body
+        return roi
+
+    def segment_whole_breast(self, ct_volume: np.ndarray, roi_mask: np.ndarray = None) -> dict:
+        """Segment left and right whole-breast regions.
+
+        Parameters
+        ----------
+        ct_volume:
+            3-D CT array in HU, shape (Z, Y, X) in standard axial orientation.
+        roi_mask:
+            Optional pre-computed anterior-thorax ROI mask.  If not supplied it
+            is computed automatically via ``_breast_roi_mask``.
+
+        Returns
+        -------
+        dict with keys ``right_mask`` and ``left_mask`` (Boolean 3-D arrays).
+        """
+        nz, ny, nx = ct_volume.shape
+
+        # Step 1 — restrict to anterior thorax
+        if roi_mask is None:
+            roi_mask = self._breast_roi_mask(ct_volume)
+
+        # Step 2 — HU-based breast tissue candidate mask within the ROI
+        breast_hu = (ct_volume >= _BD_HU_BREAST_MIN) & (ct_volume <= _BD_HU_BREAST_MAX)
+        breast = breast_hu & roi_mask
+
+        # Step 3 — morphological clean-up
         breast = _bd_binary_closing(breast, footprint=np.ones((3, 3, 3)))
         breast = _bd_remove_small_objects(breast, min_size=2_000)
-        midline = ct_volume.shape[2] // 2
+
+        # Step 4 — exclude posterior 40 % of AP depth (spine, pectoralis, ribs)
+        #           within the breast HU candidates (belt-and-suspenders check)
+        y_post_start = max(1, int(ny * self._ANTERIOR_FRACTION))
+        breast[:, y_post_start:, :] = False
+
+        # Step 5 — left / right split along X midline
+        midline = nx // 2
         right_mask = np.zeros_like(breast, dtype=bool)
         left_mask = np.zeros_like(breast, dtype=bool)
         right_mask[:, :, :midline] = breast[:, :, :midline]
         left_mask[:, :, midline:] = breast[:, :, midline:]
+
         right_mask = _bd_remove_small_objects(right_mask, min_size=1_000)
         left_mask = _bd_remove_small_objects(left_mask, min_size=1_000)
+
         return {"right_mask": right_mask, "left_mask": left_mask}
 
     def segment_fibroglandular(self, ct_volume: np.ndarray, breast_mask: np.ndarray) -> np.ndarray:
@@ -4960,26 +5108,38 @@ class BreastSegmentor:
         cleaned = fg_mask.copy()
         if not cleaned.any():
             return cleaned
-        breast_mask = (ct_volume >= _BD_HU_BREAST_MIN) & (ct_volume <= _BD_HU_BREAST_MAX)
-        breast_mask = _bd_binary_closing(breast_mask, footprint=np.ones((3, 3, 3)))
+
+        # Use the breast ROI boundary (HU range) to derive the skin shell —
+        # only within the anterior thorax so we don't touch abdominal organs.
+        breast_hu = (ct_volume >= _BD_HU_BREAST_MIN) & (ct_volume <= _BD_HU_BREAST_MAX)
+        # Limit to anterior half to avoid accidental posterior structures
+        ny = ct_volume.shape[1]
+        y_post_start = max(1, int(ny * self._ANTERIOR_FRACTION))
+        breast_hu[:, y_post_start:, :] = False
+        breast_mask = _bd_binary_closing(breast_hu, footprint=np.ones((3, 3, 3)))
+
         inner = _bd_ndi.binary_erosion(breast_mask, iterations=2)
         skin_shell = breast_mask & ~inner
         cleaned &= ~skin_shell
 
+        # Pectoralis: posterior region HU > muscle threshold
         posterior_region = np.zeros_like(cleaned, dtype=bool)
-        posterior_start = int(ct_volume.shape[1] * 0.66)
+        # Posterior starts at 50% of AP depth (conservative — only flag rear half)
+        posterior_start = int(ct_volume.shape[1] * 0.50)
         posterior_region[:, posterior_start:, :] = True
         pectoralis = posterior_region & (ct_volume > _BD_HU_MUSCLE_MIN)
         cleaned &= ~pectoralis
 
+        # Metal clips: small bright objects
         clips = (ct_volume > _BD_HU_CLIP_MIN) & cleaned
         labels, n_labels = _bd_ndi.label(clips)
         if n_labels:
-            sizes = np.bincount(labels.ravel())           # sizes[i] = voxels in component i
-            small_ids = np.nonzero(sizes[1:] <= 500)[0] + 1  # 1-based ids of small components
+            sizes = np.bincount(labels.ravel())
+            small_ids = np.nonzero(sizes[1:] <= 500)[0] + 1
             if small_ids.size:
                 cleaned &= ~np.isin(labels, small_ids)
 
+        # Remove single largest bright component (heuristic tumor exclusion)
         tumor_candidates = cleaned & (ct_volume > 20)
         labels, n_labels = _bd_ndi.label(tumor_candidates)
         if n_labels:
@@ -5003,7 +5163,7 @@ class BreastSegmentor:
         skin = breast_mask & ~inner
 
         posterior_region = np.zeros(ct_volume.shape, dtype=bool)
-        posterior_start = int(ct_volume.shape[1] * 0.66)
+        posterior_start = int(ct_volume.shape[1] * 0.50)
         posterior_region[:, posterior_start:, :] = True
         pectoralis = posterior_region & (ct_volume > _BD_HU_MUSCLE_MIN) & breast_mask
 
