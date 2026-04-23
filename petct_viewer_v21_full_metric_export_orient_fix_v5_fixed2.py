@@ -5331,6 +5331,31 @@ def _bd_train_classifiers(df, feature_columns, target_col):
     return auc_results, curves
 
 
+# ═══ Background worker thread for long-running breast density / complexity ops ═══
+class _BreastWorker(QtCore.QThread):
+    """Generic QThread worker that calls a callable in a background thread.
+
+    Signals:
+        finished(dict) — emitted on success with a result payload
+        error(str)     — emitted on exception with the error message string
+    """
+    finished = QtCore.pyqtSignal(dict)
+    error = QtCore.pyqtSignal(str)
+
+    def __init__(self, func, *args, **kwargs):
+        super().__init__()
+        self._func = func
+        self._args = args
+        self._kwargs = kwargs
+
+    def run(self):
+        try:
+            result = self._func(*self._args, **self._kwargs)
+            self.finished.emit(result if isinstance(result, dict) else {})
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
 # ═══ V21BreastDensityTab — PyQt6 widget for Clinical Tools dialog ═══
 class V21BreastDensityTab(QtWidgets.QWidget):
     """Breast density and parenchymal complexity analysis tab for the Clinical Tools dialog.
@@ -5357,6 +5382,7 @@ class V21BreastDensityTab(QtWidgets.QWidget):
         self._parenchymal_mask = None         # active mask fed to complexity engine
         self._roi_left: Optional[np.ndarray] = None    # manually labelled left breast ROI
         self._roi_right: Optional[np.ndarray] = None   # manually labelled right breast ROI
+        self._worker: Optional[_BreastWorker] = None   # background computation thread
         self._build()
 
     # ------------------------------------------------------------------
@@ -5555,6 +5581,39 @@ class V21BreastDensityTab(QtWidgets.QWidget):
         self._log.setPlaceholderText("Log output …")
         root.addWidget(self._log)
 
+        # --- Busy status label (shown while background thread runs) ---
+        self._lbl_busy = QtWidgets.QLabel("")
+        self._lbl_busy.setStyleSheet(
+            "color: #7d3c98; background: #f9f0ff; padding: 4px; border-radius: 4px; font-style: italic;"
+        )
+        self._lbl_busy.setVisible(False)
+        root.addWidget(self._lbl_busy)
+
+    # ------------------------------------------------------------------
+    def _set_busy(self, busy: bool, message: str = "") -> None:
+        """Disable/enable all action buttons and show a status message while a worker runs."""
+        action_btns = [
+            self._btn_segment_fg, self._btn_density, self._btn_complexity,
+            self._btn_complexity_right, self._btn_complexity_left,
+        ]
+        for btn in action_btns:
+            btn.setEnabled(not busy if btn.isEnabled() or not busy else False)
+        if busy:
+            # Disable every action button unconditionally while busy
+            for btn in action_btns:
+                btn.setEnabled(False)
+            self._lbl_busy.setText(f"⏳  {message}")
+            self._lbl_busy.setVisible(True)
+        else:
+            self._lbl_busy.setVisible(False)
+            # Re-enable buttons that should be active based on current state
+            has_fg = bool(self._fg_masks)
+            self._btn_segment_fg.setEnabled(BREAST_DENSITY_DEPS_AVAILABLE)
+            self._btn_density.setEnabled(BREAST_DENSITY_DEPS_AVAILABLE)
+            self._btn_complexity.setEnabled(BREAST_DENSITY_DEPS_AVAILABLE and self._parenchymal_mask is not None)
+            self._btn_complexity_right.setEnabled(BREAST_DENSITY_DEPS_AVAILABLE and "right" in self._fg_masks)
+            self._btn_complexity_left.setEnabled(BREAST_DENSITY_DEPS_AVAILABLE and "left" in self._fg_masks)
+
     # ------------------------------------------------------------------
     def _update_roi_status(self):
         parts = []
@@ -5667,14 +5726,7 @@ class V21BreastDensityTab(QtWidgets.QWidget):
     # Fibroglandular segmentation on per-breast ROIs
     # ------------------------------------------------------------------
     def _on_segment_fg(self):
-        """Run fibroglandular segmentation independently on each labelled breast ROI.
-
-        This is the dedicated 'Step 2' button.  It uses the manually drawn ROIs as the
-        whole-breast masks — exactly matching the user-drawn boundary — and then:
-          1. BreastSegmentor.segment_fibroglandular()  — HU threshold inside the ROI
-          2. BreastSegmentor.exclude_non_parenchymal() — strips skin shell, pectoralis, clips
-        Results are stored per-side and shown in the Density results table.
-        """
+        """Run fibroglandular segmentation in a background thread (non-blocking)."""
         ct_hu = getattr(self._app, "ct_hu", None)
         if ct_hu is None:
             QtWidgets.QMessageBox.warning(self, "Segment FG", "No CT volume loaded.")
@@ -5690,27 +5742,27 @@ class V21BreastDensityTab(QtWidgets.QWidget):
         spacing = getattr(self._app, "spacing_zyx", (1.0, 1.0, 1.0))
         voxel_spacing_mm = (float(spacing[0]), float(spacing[1]), float(spacing[2]))
         vox_cc = float(np.prod(voxel_spacing_mm) / 1000.0)
-        self._log_msg("[FG] Running fibroglandular segmentation on labelled ROIs …")
-        QtWidgets.QApplication.processEvents()
-        try:
+        # Snapshot ROI references before launching thread (they must not change mid-run)
+        roi_right = self._roi_right.copy() if self._roi_right is not None else None
+        roi_left = self._roi_left.copy() if self._roi_left is not None else None
+        ct_snap = ct_hu.copy()
+
+        def _compute():
             segmentor = BreastSegmentor()
             results: dict = {}
-            self._fg_masks = {}
-
-            for side, roi in (("right", self._roi_right), ("left", self._roi_left)):
+            fg_masks: dict = {}
+            for side, roi in (("right", roi_right), ("left", roi_left)):
                 if roi is None:
                     continue
                 whole_vol_cc = float(np.sum(roi)) * vox_cc
-                fg_raw = segmentor.segment_fibroglandular(ct_hu, roi)
-                fg_clean = segmentor.exclude_non_parenchymal(fg_raw, ct_hu)
+                fg_raw = segmentor.segment_fibroglandular(ct_snap, roi)
+                fg_clean = segmentor.exclude_non_parenchymal(fg_raw, ct_snap)
                 # Intersect with the drawn ROI so the cleaned fibroglandular mask
                 # never extends beyond the manually defined breast boundary.
-                # exclude_non_parenchymal operates on the whole volume and can
-                # produce voxels outside the user's ROI after morphological ops.
                 fg_clean = fg_clean & roi
                 fg_vol_cc = float(np.sum(fg_clean)) * vox_cc
                 fat_vol_cc = max(0.0, whole_vol_cc - fg_vol_cc)
-                self._fg_masks[side] = fg_clean
+                fg_masks[side] = fg_clean
                 results.update({
                     f"{side}_breast_roi_vol_cc": round(whole_vol_cc, 3),
                     f"{side}_fibroglandular_vol_cc": round(fg_vol_cc, 3),
@@ -5719,12 +5771,7 @@ class V21BreastDensityTab(QtWidgets.QWidget):
                         fg_vol_cc / whole_vol_cc * 100.0 if whole_vol_cc > 0 else 0.0, 3),
                     f"{side}_roi_source": "manual_viewer_roi",
                 })
-                self._log_msg(f"[FG] {side.upper()}: whole={whole_vol_cc:.1f} cc, "
-                              f"FG={fg_vol_cc:.1f} cc, density="
-                              f"{results[f'{side}_volumetric_density_pct']:.1f}%")
-
-            # Bilateral totals if both sides available
-            if "right" in self._fg_masks and "left" in self._fg_masks:
+            if "right" in fg_masks and "left" in fg_masks:
                 r_fg = results["right_fibroglandular_vol_cc"]
                 l_fg = results["left_fibroglandular_vol_cc"]
                 r_w = results["right_breast_roi_vol_cc"]
@@ -5740,50 +5787,65 @@ class V21BreastDensityTab(QtWidgets.QWidget):
                         abs(results["right_volumetric_density_pct"] -
                             results["left_volumetric_density_pct"]), 3),
                 })
+            return {"results": results, "fg_masks": fg_masks}
 
-            self._density_results = results
-            self._fill_table(self._density_table, results)
-            self._result_tabs.setCurrentIndex(0)
+        self._log_msg("[FG] Running fibroglandular segmentation on labelled ROIs …")
+        self._set_busy(True, "Segmenting fibroglandular tissue … please wait")
+        self._worker = _BreastWorker(_compute)
+        self._worker.finished.connect(self._on_segment_fg_done)
+        self._worker.error.connect(self._on_segment_fg_error)
+        self._worker.start()
 
-            # Use union of available FG masks as the active parenchymal mask
-            fg_union = None
-            for m in self._fg_masks.values():
-                fg_union = m if fg_union is None else (fg_union | m)
-            self._parenchymal_mask = fg_union
+    def _on_segment_fg_done(self, payload: dict):
+        self._set_busy(False)
+        results = payload.get("results", {})
+        fg_masks = payload.get("fg_masks", {})
+        self._fg_masks = fg_masks
+        self._density_results = results
+        self._fill_table(self._density_table, results)
+        self._result_tabs.setCurrentIndex(0)
+        fg_union = None
+        for m in fg_masks.values():
+            fg_union = m if fg_union is None else (fg_union | m)
+        self._parenchymal_mask = fg_union
+        self._btn_export.setEnabled(True)
+        self._push_seg_overlays()
+        for side, mask in fg_masks.items():
+            spacing = getattr(self._app, "spacing_zyx", (1.0, 1.0, 1.0))
+            vox_cc = float(np.prod([float(s) for s in spacing]) / 1000.0)
+            self._log_msg(f"[FG] {side.upper()}: FG={float(np.sum(mask)) * vox_cc:.1f} cc, "
+                          f"density={results.get(f'{side}_volumetric_density_pct', 0.0):.1f}%")
+        self._log_msg("[FG] Done. Colour overlays: cyan=right whole, blue=left whole, "
+                      "orange=right FG, gold=left FG. "
+                      "Skin, pectoralis and clips are excluded automatically.")
 
-            self._btn_complexity.setEnabled(BREAST_DENSITY_DEPS_AVAILABLE and fg_union is not None)
-            self._btn_complexity_right.setEnabled(BREAST_DENSITY_DEPS_AVAILABLE and "right" in self._fg_masks)
-            self._btn_complexity_left.setEnabled(BREAST_DENSITY_DEPS_AVAILABLE and "left" in self._fg_masks)
-            self._btn_export.setEnabled(True)
-            self._push_seg_overlays()
-            self._log_msg("[FG] Done. Colour overlays: cyan=right whole, blue=left whole, "
-                          "orange=right FG, gold=left FG. "
-                          "Skin, pectoralis and clips are excluded automatically.")
-        except Exception as exc:
-            self._log_msg(f"[FG] ERROR: {exc}")
-            QtWidgets.QMessageBox.critical(self, "FG Segmentation Error", str(exc))
+    def _on_segment_fg_error(self, msg: str):
+        self._set_busy(False)
+        self._log_msg(f"[FG] ERROR: {msg}")
+        QtWidgets.QMessageBox.critical(self, "FG Segmentation Error", msg)
 
     # ------------------------------------------------------------------
     def _on_compute_density(self):
+        """Run automatic whole-breast density in a background thread (non-blocking)."""
         ct_hu = getattr(self._app, "ct_hu", None)
         if ct_hu is None:
             QtWidgets.QMessageBox.warning(self, "Breast Density", "No CT volume loaded. Load a CT study first.")
             return
         spacing = getattr(self._app, "spacing_zyx", (1.0, 1.0, 1.0))
         voxel_spacing_mm = (float(spacing[0]), float(spacing[1]), float(spacing[2]))
-        self._log_msg("[Density] Starting auto-segmentation …")
-        QtWidgets.QApplication.processEvents()
-        try:
+        ct_snap = ct_hu.copy()
+
+        def _compute():
             segmentor = BreastSegmentor()
-            self._whole_masks = segmentor.segment_whole_breast(ct_hu)
+            whole_masks = segmentor.segment_whole_breast(ct_snap)
             vox_cc = float(np.prod(voxel_spacing_mm) / 1000.0)
-            self._fg_masks = {}
+            fg_masks: dict = {}
             results: dict = {}
             for side in ("right", "left"):
-                breast_mask = self._whole_masks[f"{side}_mask"]
-                fg_raw = segmentor.segment_fibroglandular(ct_hu, breast_mask)
-                fg_clean = segmentor.exclude_non_parenchymal(fg_raw, ct_hu)
-                self._fg_masks[side] = fg_clean
+                breast_mask = whole_masks[f"{side}_mask"]
+                fg_raw = segmentor.segment_fibroglandular(ct_snap, breast_mask)
+                fg_clean = segmentor.exclude_non_parenchymal(fg_raw, ct_snap)
+                fg_masks[side] = fg_clean
                 whole_vol_cc = float(np.sum(breast_mask)) * vox_cc
                 fg_vol_cc = float(np.sum(fg_clean)) * vox_cc
                 fat_vol_cc = max(0.0, whole_vol_cc - fg_vol_cc)
@@ -5795,9 +5857,6 @@ class V21BreastDensityTab(QtWidgets.QWidget):
                         fg_vol_cc / whole_vol_cc * 100.0 if whole_vol_cc > 0 else 0.0, 3),
                     f"{side}_roi_source": "auto_segmentation",
                 })
-                self._log_msg(f"[Density] {side.upper()}: whole={whole_vol_cc:.1f} cc, "
-                              f"FG={fg_vol_cc:.1f} cc, density="
-                              f"{results[f'{side}_volumetric_density_pct']:.1f}%")
             r_w = results["right_whole_breast_vol_cc"]
             l_w = results["left_whole_breast_vol_cc"]
             r_fg = results["right_fibroglandular_vol_cc"]
@@ -5813,26 +5872,46 @@ class V21BreastDensityTab(QtWidgets.QWidget):
                     abs(results["right_volumetric_density_pct"] -
                         results["left_volumetric_density_pct"]), 3),
             })
-            self._density_results = results
-            self._fill_table(self._density_table, results)
-            self._result_tabs.setCurrentIndex(0)
-            fg_union = self._fg_masks["right"] | self._fg_masks["left"]
-            self._parenchymal_mask = fg_union
-            self._btn_complexity.setEnabled(BREAST_DENSITY_DEPS_AVAILABLE)
-            self._btn_complexity_right.setEnabled(BREAST_DENSITY_DEPS_AVAILABLE)
-            self._btn_complexity_left.setEnabled(BREAST_DENSITY_DEPS_AVAILABLE)
-            self._btn_export.setEnabled(True)
-            self._push_seg_overlays()
-            self._log_msg("[Density] Done. Colour overlays: cyan=right whole, blue=left whole, "
-                          "orange=right FG, gold=left FG. "
-                          "Skin, pectoralis and clips are excluded automatically.")
-        except Exception as exc:
-            self._log_msg(f"[Density] ERROR: {exc}")
-            QtWidgets.QMessageBox.critical(self, "Breast Density Error", str(exc))
+            return {"results": results, "fg_masks": fg_masks, "whole_masks": whole_masks}
+
+        self._log_msg("[Density] Starting auto-segmentation …")
+        self._set_busy(True, "Auto-segmenting whole breast + fibroglandular tissue … please wait")
+        self._worker = _BreastWorker(_compute)
+        self._worker.finished.connect(self._on_density_done)
+        self._worker.error.connect(self._on_density_error)
+        self._worker.start()
+
+    def _on_density_done(self, payload: dict):
+        self._set_busy(False)
+        results = payload.get("results", {})
+        fg_masks = payload.get("fg_masks", {})
+        whole_masks = payload.get("whole_masks", {})
+        self._fg_masks = fg_masks
+        self._whole_masks = whole_masks
+        self._density_results = results
+        self._fill_table(self._density_table, results)
+        self._result_tabs.setCurrentIndex(0)
+        if "right" in fg_masks and "left" in fg_masks:
+            self._parenchymal_mask = fg_masks["right"] | fg_masks["left"]
+        self._btn_export.setEnabled(True)
+        self._push_seg_overlays()
+        for side in ("right", "left"):
+            self._log_msg(f"[Density] {side.upper()}: "
+                          f"whole={results.get(f'{side}_whole_breast_vol_cc', 0.0):.1f} cc, "
+                          f"FG={results.get(f'{side}_fibroglandular_vol_cc', 0.0):.1f} cc, "
+                          f"density={results.get(f'{side}_volumetric_density_pct', 0.0):.1f}%")
+        self._log_msg("[Density] Done. Colour overlays: cyan=right whole, blue=left whole, "
+                      "orange=right FG, gold=left FG. "
+                      "Skin, pectoralis and clips are excluded automatically.")
+
+    def _on_density_error(self, msg: str):
+        self._set_busy(False)
+        self._log_msg(f"[Density] ERROR: {msg}")
+        QtWidgets.QMessageBox.critical(self, "Breast Density Error", msg)
 
     # ------------------------------------------------------------------
     def _on_compute_complexity(self):
-        """Run complexity on the bilateral parenchymal mask (union of left + right FG masks)."""
+        """Run bilateral complexity radiomics in a background thread (non-blocking)."""
         ct_hu = getattr(self._app, "ct_hu", None)
         if ct_hu is None or self._parenchymal_mask is None:
             QtWidgets.QMessageBox.warning(self, "Breast Complexity",
@@ -5841,25 +5920,39 @@ class V21BreastDensityTab(QtWidgets.QWidget):
             return
         spacing = getattr(self._app, "spacing_zyx", (1.0, 1.0, 1.0))
         voxel_spacing_mm = (float(spacing[0]), float(spacing[1]), float(spacing[2]))
+        ct_snap = ct_hu.copy()
+        mask_snap = self._parenchymal_mask.copy()
+
+        def _compute():
+            engine = ParenchymalComplexityEngine(ct_snap, mask_snap, voxel_spacing_mm)
+            return {"complexity": engine.compute_all()}
+
         self._log_msg("[Complexity] Computing bilateral radiomics features …")
-        QtWidgets.QApplication.processEvents()
-        try:
-            engine = ParenchymalComplexityEngine(ct_hu, self._parenchymal_mask, voxel_spacing_mm)
-            self._complexity_results = engine.compute_all()
-            # Prefix bilateral keys
-            prefixed = {f"bilateral_{k}" if not k.startswith("bilateral_") else k: v
-                        for k, v in self._complexity_results.items() if k != "manuscript_shortlist"}
-            self._fill_table(self._shortlist_table, self._complexity_results.get("manuscript_shortlist", {}))
-            self._fill_table(self._full_table, prefixed)
-            self._result_tabs.setCurrentIndex(1)
-            self._btn_export.setEnabled(True)
-            self._log_msg("[Complexity] Done (bilateral).")
-        except Exception as exc:
-            self._log_msg(f"[Complexity] ERROR: {exc}")
-            QtWidgets.QMessageBox.critical(self, "Complexity Error", str(exc))
+        self._set_busy(True, "Computing bilateral radiomics … please wait")
+        self._worker = _BreastWorker(_compute)
+        self._worker.finished.connect(self._on_complexity_done)
+        self._worker.error.connect(self._on_complexity_error)
+        self._worker.start()
+
+    def _on_complexity_done(self, payload: dict):
+        self._set_busy(False)
+        complexity = payload.get("complexity", {})
+        self._complexity_results = complexity
+        prefixed = {f"bilateral_{k}" if not k.startswith("bilateral_") else k: v
+                    for k, v in complexity.items() if k != "manuscript_shortlist"}
+        self._fill_table(self._shortlist_table, complexity.get("manuscript_shortlist", {}))
+        self._fill_table(self._full_table, prefixed)
+        self._result_tabs.setCurrentIndex(1)
+        self._btn_export.setEnabled(True)
+        self._log_msg("[Complexity] Done (bilateral).")
+
+    def _on_complexity_error(self, msg: str):
+        self._set_busy(False)
+        self._log_msg(f"[Complexity] ERROR: {msg}")
+        QtWidgets.QMessageBox.critical(self, "Complexity Error", msg)
 
     def _on_compute_complexity_side(self, side: str):
-        """Run complexity radiomics on one breast's fibroglandular mask."""
+        """Run per-breast complexity radiomics in a background thread (non-blocking)."""
         ct_hu = getattr(self._app, "ct_hu", None)
         fg_mask = self._fg_masks.get(side)
         if ct_hu is None or fg_mask is None:
@@ -5871,25 +5964,38 @@ class V21BreastDensityTab(QtWidgets.QWidget):
             return
         spacing = getattr(self._app, "spacing_zyx", (1.0, 1.0, 1.0))
         voxel_spacing_mm = (float(spacing[0]), float(spacing[1]), float(spacing[2]))
+        ct_snap = ct_hu.copy()
+        mask_snap = fg_mask.copy()
+
+        def _compute():
+            engine = ParenchymalComplexityEngine(ct_snap, mask_snap, voxel_spacing_mm)
+            return {"complexity": engine.compute_all(), "side": side}
+
         self._log_msg(f"[Complexity] Computing {side.upper()} breast radiomics …")
-        QtWidgets.QApplication.processEvents()
-        try:
-            engine = ParenchymalComplexityEngine(ct_hu, fg_mask, voxel_spacing_mm)
-            results = engine.compute_all()
-            # Prefix keys with side so they don't overwrite bilateral results
-            prefixed = {f"{side}_{k}" if not k.startswith(side + "_") else k: v
-                        for k, v in results.items() if k != "manuscript_shortlist"}
-            # Merge into existing complexity results (per-side results live alongside bilateral)
-            self._complexity_results.update(prefixed)
-            self._fill_table(self._shortlist_table, results.get("manuscript_shortlist", {}))
-            full = {k: v for k, v in self._complexity_results.items() if k != "manuscript_shortlist"}
-            self._fill_table(self._full_table, full)
-            self._result_tabs.setCurrentIndex(2)
-            self._btn_export.setEnabled(True)
-            self._log_msg(f"[Complexity] Done ({side.upper()}).")
-        except Exception as exc:
-            self._log_msg(f"[Complexity] ERROR: {exc}")
-            QtWidgets.QMessageBox.critical(self, f"Complexity {side.upper()} Error", str(exc))
+        self._set_busy(True, f"Computing {side.upper()} breast radiomics … please wait")
+        self._worker = _BreastWorker(_compute)
+        self._worker.finished.connect(self._on_complexity_side_done)
+        self._worker.error.connect(lambda msg, s=side: self._on_complexity_side_error(s, msg))
+        self._worker.start()
+
+    def _on_complexity_side_done(self, payload: dict):
+        self._set_busy(False)
+        side = payload.get("side", "unknown")
+        results = payload.get("complexity", {})
+        prefixed = {f"{side}_{k}" if not k.startswith(side + "_") else k: v
+                    for k, v in results.items() if k != "manuscript_shortlist"}
+        self._complexity_results.update(prefixed)
+        self._fill_table(self._shortlist_table, results.get("manuscript_shortlist", {}))
+        full = {k: v for k, v in self._complexity_results.items() if k != "manuscript_shortlist"}
+        self._fill_table(self._full_table, full)
+        self._result_tabs.setCurrentIndex(2)
+        self._btn_export.setEnabled(True)
+        self._log_msg(f"[Complexity] Done ({side.upper()}).")
+
+    def _on_complexity_side_error(self, side: str, msg: str):
+        self._set_busy(False)
+        self._log_msg(f"[Complexity] ERROR ({side.upper()}): {msg}")
+        QtWidgets.QMessageBox.critical(self, f"Complexity {side.upper()} Error", msg)
 
     def _on_export_csv(self):
         if not self._density_results and not self._complexity_results:
