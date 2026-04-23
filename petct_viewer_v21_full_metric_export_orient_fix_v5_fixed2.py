@@ -520,10 +520,18 @@ class SliceView(QtWidgets.QWidget):
         if self.view_type == "coronal": return np.clip(yi, 0, nz-1), self.slice_idx, np.clip(xi, 0, nx-1)
         return np.clip(yi, 0, nz-1), np.clip(xi, 0, ny-1), self.slice_idx
     def voxel_to_display(self, z, y, x):
+        """Return mm scene coordinates for a voxel position (used for crosshair lines).
+
+        After _apply_image_rects the ViewBox scene is in physical mm, so
+        crosshair lines must also be positioned in mm.
+        """
+        sz, sy, sx = self.spacing_zyx
         nz, ny, nx = self.pet_suv.shape
-        if self.view_type == "axial": return float(x), float((ny-1)-y)
-        if self.view_type == "coronal": return float(x), float(z)
-        return float(y), float(z)
+        if self.view_type == "axial":
+            return float(x) * sx, float((ny - 1) - y) * sy
+        if self.view_type == "coronal":
+            return float(x) * sx, float(z) * sz
+        return float(y) * sy, float(z) * sz
     def set_crosshair(self, z, y, x, update_slice=False):
         self.cross_z, self.cross_y, self.cross_x = int(z), int(y), int(x)
         if update_slice and not self.is_mip_active:
@@ -535,6 +543,40 @@ class SliceView(QtWidgets.QWidget):
         self.sig_crosshair_changed.emit(z, y, x); self.update_crosshair_lines()
     def request_region_grow(self, x_disp, y_disp):
         z, y, x = self.display_to_voxel(x_disp, y_disp); self.sig_region_grow_req.emit(z, y, x)
+
+    # ------------------------------------------------------------------
+    # Physical-spacing helpers (fix left-right stretching artifact)
+    # ------------------------------------------------------------------
+    def _slice_spacing_mm(self):
+        """Return (row_spacing_mm, col_spacing_mm) for the slice shown in this view.
+
+        Slices are stored as (rows, cols):
+          axial   → rows = Y voxels (sy),  cols = X voxels (sx)
+          coronal → rows = Z voxels (sz),  cols = X voxels (sx)
+          sagittal→ rows = Z voxels (sz),  cols = Y voxels (sy)
+        """
+        sz, sy, sx = self.spacing_zyx
+        if self.view_type == "axial":
+            return float(sy), float(sx)
+        if self.view_type == "coronal":
+            return float(sz), float(sx)
+        return float(sz), float(sy)
+
+    def _apply_image_rects(self, nrows: int, ncols: int) -> None:
+        """Scale ImageItems so each pixel occupies its true physical size in mm.
+
+        After setRect the ViewBox scene coordinate is in mm, eliminating the
+        left-right (transverse) stretch that occurs when voxels are not isotropic.
+        """
+        row_sp, col_sp = self._slice_spacing_mm()
+        rect = QtCore.QRectF(0.0, 0.0, float(ncols) * col_sp, float(nrows) * row_sp)
+        for img_item in (self.img_ct, self.img_pet, self.img_mask):
+            try:
+                img_item.setRect(rect)
+            except Exception:
+                pass
+    # ------------------------------------------------------------------
+
     def apply_brush(self, x_disp, y_disp, commit=True):
         if self.mask is None: return
         z, y, x = self.display_to_voxel(x_disp, y_disp)
@@ -559,23 +601,31 @@ class SliceView(QtWidgets.QWidget):
         if self.mode == "paint": target_slice[mask_local] = True
         elif self.mode == "erase": target_slice[mask_local] = False
         self.update_view(); self.update_crosshair_lines()
-        if commit: self.sig_mask_changed.emit()
-    def lasso_begin(self, x, y): self._lasso_pts_disp = [(float(x), float(y))]; self.lasso_item.setData([x], [y]); self.lasso_item.setVisible(True)
+        # Always emit so the other two orthogonal views update in real-time during painting
+        self.sig_mask_changed.emit()
+    def lasso_begin(self, x, y):
+        # x, y are image-local pixel coords (from img_ct.mapFromScene after setRect)
+        self._lasso_pts_px = [(float(x), float(y))]
+        row_sp, col_sp = self._slice_spacing_mm()
+        self.lasso_item.setData([float(x) * col_sp], [float(y) * row_sp])
+        self.lasso_item.setVisible(True)
     def lasso_add(self, x, y):
-        if not getattr(self, "_lasso_pts_disp", None): self.lasso_begin(x, y); return
-        lx, ly = self._lasso_pts_disp[-1]
-        if (x-lx)**2 + (y-ly)**2 < 0.25: return
-        self._lasso_pts_disp.append((float(x), float(y)))
-        self.lasso_item.setData([p[0] for p in self._lasso_pts_disp], [p[1] for p in self._lasso_pts_disp])
+        if not getattr(self, "_lasso_pts_px", None): self.lasso_begin(x, y); return
+        lx, ly = self._lasso_pts_px[-1]
+        if (x-lx)**2 + (y-ly)**2 < 0.25: return  # min-distance threshold in pixel space
+        self._lasso_pts_px.append((float(x), float(y)))
+        row_sp, col_sp = self._slice_spacing_mm()
+        self.lasso_item.setData([p[0]*col_sp for p in self._lasso_pts_px],
+                                 [p[1]*row_sp for p in self._lasso_pts_px])
     def lasso_end(self, x, y):
-        self.lasso_add(x, y); pts = getattr(self, "_lasso_pts_disp", []); self.lasso_item.setVisible(False)
-        if len(pts) < 3: self._lasso_pts_disp = []; return
+        self.lasso_add(x, y); pts = getattr(self, "_lasso_pts_px", []); self.lasso_item.setVisible(False)
+        if len(pts) < 3: self._lasso_pts_px = []; return
         xs, ys = [p[0] for p in pts] + [pts[0][0]], [p[1] for p in pts] + [pts[0][1]]
         z, y, x = self.current_zyx
         if self.view_type == "axial": self.mask[z, :, :] |= _polyfill_2d(self.mask.shape[1], self.mask.shape[2], xs, ys)[::-1]
         elif self.view_type == "coronal": self.mask[:, y, :] |= _polyfill_2d(self.mask.shape[0], self.mask.shape[2], ys, xs)
         else: self.mask[:, :, x] |= _polyfill_2d(self.mask.shape[0], self.mask.shape[1], ys, xs)
-        self._lasso_pts_disp = []; self.update_view(); self.sig_mask_changed.emit()
+        self._lasso_pts_px = []; self.update_view(); self.sig_mask_changed.emit()
     def update_crosshair_lines(self):
         x, y = self.voxel_to_display(self.cross_z, self.cross_y, self.cross_x)
         self.vline.setPos(x); self.hline.setPos(y)
@@ -625,13 +675,18 @@ class SliceView(QtWidgets.QWidget):
             self.img_mask.setImage(ov, levels=(0, 255), autoLevels=False)
         else: 
             self.img_mask.clear()
+        # Apply physical-spacing rects so anatomy is displayed without transverse stretch
+        self._apply_image_rects(ct2.shape[0], ct2.shape[1])
         self.lbl_slice.setText("MIP (Whole Body)" if self.is_mip_active else f"{self.slider.value()+1}/{self.slider.maximum()+1}")
         self.update_crosshair_lines()
         if reset: self.reset_view()
     def reset_view(self):
         if self.ct_hu is None: return
         ct2, _, _ = self._get_slice_arrays()
-        self.vb.setRange(QtCore.QRectF(0, 0, ct2.shape[1], ct2.shape[0]), padding=0.0)
+        row_sp, col_sp = self._slice_spacing_mm()
+        w_mm = float(ct2.shape[1]) * col_sp
+        h_mm = float(ct2.shape[0]) * row_sp
+        self.vb.setRange(QtCore.QRectF(0.0, 0.0, w_mm, h_mm), padding=0.0)
 
 
 # --- 3D Rotating MIP Player (fixed + sized to screen) ---
@@ -5280,15 +5335,25 @@ class V21BreastDensityTab(QtWidgets.QWidget):
 
         # --- Compute buttons row ---
         btn_row = QtWidgets.QHBoxLayout()
-        self._btn_density = QtWidgets.QPushButton("▶  Compute Density")
+        self._btn_density = QtWidgets.QPushButton("▶  Compute Density (Auto)")
         self._btn_density.setEnabled(BREAST_DENSITY_DEPS_AVAILABLE)
-        self._btn_density.setToolTip("Run whole-breast segmentation and volumetric density computation on loaded CT")
+        self._btn_density.setToolTip("Run automatic whole-breast segmentation and volumetric density computation on loaded CT")
         self._btn_density.clicked.connect(self._on_compute_density)
         btn_row.addWidget(self._btn_density)
 
+        self._btn_use_roi = QtWidgets.QPushButton("🖊  Use Viewer ROI as Mask")
+        self._btn_use_roi.setEnabled(BREAST_DENSITY_DEPS_AVAILABLE)
+        self._btn_use_roi.setToolTip(
+            "Use the ROI drawn in the main viewer (green mask) as the breast mask for complexity analysis.\n"
+            "Workflow: draw ROI over both breasts in the main viewer (paint/lasso in any view), "
+            "then click this button to analyse that exact region."
+        )
+        self._btn_use_roi.clicked.connect(self._on_use_viewer_roi)
+        btn_row.addWidget(self._btn_use_roi)
+
         self._btn_complexity = QtWidgets.QPushButton("▶  Compute Complexity")
         self._btn_complexity.setEnabled(False)
-        self._btn_complexity.setToolTip("Run parenchymal complexity radiomics (requires Density to run first)")
+        self._btn_complexity.setToolTip("Run parenchymal complexity radiomics (requires Density or ROI mask first)")
         self._btn_complexity.clicked.connect(self._on_compute_complexity)
         btn_row.addWidget(self._btn_complexity)
 
@@ -5298,6 +5363,15 @@ class V21BreastDensityTab(QtWidgets.QWidget):
         btn_row.addWidget(self._btn_export)
         btn_row.addStretch()
         root.addLayout(btn_row)
+
+        # --- ROI guidance label ---
+        roi_hint = QtWidgets.QLabel(
+            "Tip — Draw breast ROI in the main viewer using Paint or Lasso on any view (sagittal recommended).\n"
+            "Changes update all three orthogonal views in real time. Then click '🖊 Use Viewer ROI as Mask'."
+        )
+        roi_hint.setStyleSheet("color: #1a5276; background: #eaf4fc; padding: 5px; border-radius: 4px;")
+        roi_hint.setWordWrap(True)
+        root.addWidget(roi_hint)
 
         # --- Results tabs ---
         self._result_tabs = QtWidgets.QTabWidget()
@@ -5402,7 +5476,7 @@ class V21BreastDensityTab(QtWidgets.QWidget):
             return
         spacing = getattr(self._app, "spacing_zyx", (1.0, 1.0, 1.0))
         voxel_spacing_mm = (float(spacing[0]), float(spacing[1]), float(spacing[2]))
-        self._log_msg("[Density] Starting segmentation …")
+        self._log_msg("[Density] Starting auto-segmentation …")
         QtWidgets.QApplication.processEvents()
         try:
             segmentor = BreastSegmentor()
@@ -5422,11 +5496,65 @@ class V21BreastDensityTab(QtWidgets.QWidget):
             self._log_msg(f"[Density] ERROR: {exc}")
             QtWidgets.QMessageBox.critical(self, "Breast Density Error", str(exc))
 
+    def _on_use_viewer_roi(self):
+        """Use the manually drawn ROI mask from the main viewer as the breast mask.
+
+        The user should draw ROI over both breasts (using Paint or Lasso in any of
+        the three orthogonal views; all views update in real time). After drawing,
+        clicking this button adopts that mask as the parenchymal mask and computes
+        volumetric metrics directly from the drawn region — bypassing auto-segmentation.
+        """
+        ct_hu = getattr(self._app, "ct_hu", None)
+        if ct_hu is None:
+            QtWidgets.QMessageBox.warning(self, "Viewer ROI", "No CT volume loaded. Load a CT study first.")
+            return
+        roi_mask = getattr(self._app, "mask_primary", None)
+        if roi_mask is None:
+            roi_mask = getattr(self._app, "mask", None)
+        if roi_mask is None or not np.any(roi_mask):
+            QtWidgets.QMessageBox.warning(
+                self, "Viewer ROI",
+                "No ROI has been drawn in the main viewer yet.\n\n"
+                "Switch to Paint or Lasso mode and draw the breast region on the CT. "
+                "You can draw on any view — axial, coronal, or sagittal — and all three "
+                "update automatically."
+            )
+            return
+        spacing = getattr(self._app, "spacing_zyx", (1.0, 1.0, 1.0))
+        voxel_spacing_mm = (float(spacing[0]), float(spacing[1]), float(spacing[2]))
+        vox_cc = float(np.prod(voxel_spacing_mm) / 1000.0)
+        self._log_msg(f"[ROI] Using viewer ROI — {int(np.sum(roi_mask))} voxels "
+                      f"= {float(np.sum(roi_mask)) * vox_cc:.1f} cc")
+        QtWidgets.QApplication.processEvents()
+        try:
+            # Treat the drawn ROI directly as the parenchymal mask.
+            # Compute basic volumetric density assuming drawn region = fibroglandular tissue
+            # within the whole breast (the full breast volume can be estimated as the bounding
+            # box convex hull, but for simplicity report drawn ROI as fibroglandular volume).
+            self._parenchymal_mask = roi_mask.astype(bool)
+            fg_vol_cc = float(np.sum(self._parenchymal_mask)) * vox_cc
+
+            # Build density result dict compatible with the existing table
+            self._density_results = {
+                "roi_fibroglandular_vol_cc": round(fg_vol_cc, 3),
+                "roi_voxel_count": int(np.sum(self._parenchymal_mask)),
+                "roi_source": "manual_viewer_roi",
+            }
+            self._fill_table(self._density_table, self._density_results)
+            self._result_tabs.setCurrentIndex(0)
+            self._btn_complexity.setEnabled(BREAST_DENSITY_DEPS_AVAILABLE)
+            self._btn_export.setEnabled(True)
+            self._log_msg("[ROI] Viewer ROI accepted as breast mask. Click '▶ Compute Complexity' to run radiomics.")
+        except Exception as exc:
+            self._log_msg(f"[ROI] ERROR: {exc}")
+            QtWidgets.QMessageBox.critical(self, "Viewer ROI Error", str(exc))
+
     def _on_compute_complexity(self):
         ct_hu = getattr(self._app, "ct_hu", None)
         if ct_hu is None or self._parenchymal_mask is None:
             QtWidgets.QMessageBox.warning(self, "Breast Complexity",
-                                          "Run Density computation first to generate a parenchymal mask.")
+                                          "Run 'Compute Density (Auto)' or 'Use Viewer ROI as Mask' first "
+                                          "to generate a parenchymal mask.")
             return
         spacing = getattr(self._app, "spacing_zyx", (1.0, 1.0, 1.0))
         voxel_spacing_mm = (float(spacing[0]), float(spacing[1]), float(spacing[2]))
