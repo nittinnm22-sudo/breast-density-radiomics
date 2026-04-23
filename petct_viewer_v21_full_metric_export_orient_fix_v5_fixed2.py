@@ -5703,7 +5703,10 @@ class V21BreastDensityTab(QtWidgets.QWidget):
                 whole_vol_cc = float(np.sum(roi)) * vox_cc
                 fg_raw = segmentor.segment_fibroglandular(ct_hu, roi)
                 fg_clean = segmentor.exclude_non_parenchymal(fg_raw, ct_hu)
-                # Restrict cleaned mask to the drawn ROI boundary
+                # Intersect with the drawn ROI so the cleaned fibroglandular mask
+                # never extends beyond the manually defined breast boundary.
+                # exclude_non_parenchymal operates on the whole volume and can
+                # produce voxels outside the user's ROI after morphological ops.
                 fg_clean = fg_clean & roi
                 fg_vol_cc = float(np.sum(fg_clean)) * vox_cc
                 fat_vol_cc = max(0.0, whole_vol_cc - fg_vol_cc)
