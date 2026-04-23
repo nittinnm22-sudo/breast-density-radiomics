@@ -5196,9 +5196,9 @@ class GLDMFeatures(_BDTextureFeatureBase):
             g = int(q[z, y, x])
             dep = 0
             for dz, dy, dx in [(0, 0, 1), (0, 1, 0), (1, 0, 0), (0, 0, -1), (0, -1, 0), (-1, 0, 0)]:
-                nz, ny, n_x = z + dz, y + dy, x + dx
-                if 0 <= nz < q.shape[0] and 0 <= ny < q.shape[1] and 0 <= n_x < q.shape[2]:
-                    if parenchymal_mask[nz, ny, n_x] and q[nz, ny, n_x] == g:
+                nz, ny, nx = z + dz, y + dy, x + dx
+                if 0 <= nz < q.shape[0] and 0 <= ny < q.shape[1] and 0 <= nx < q.shape[2]:
+                    if parenchymal_mask[nz, ny, nx] and q[nz, ny, nx] == g:
                         dep += 1
             max_dep = max(max_dep, dep)
             dep_counts[(g, dep)] = dep_counts.get((g, dep), 0) + 1
@@ -5238,10 +5238,10 @@ class NGTDMFeatures(_BDTextureFeatureBase):
             g = int(q[z, y, x])
             neighbors = []
             for dz, dy, dx in [(0, 0, 1), (0, 0, -1), (0, 1, 0), (0, -1, 0), (1, 0, 0), (-1, 0, 0)]:
-                nz, ny, n_x = z + dz, y + dy, x + dx
-                if 0 <= nz < q.shape[0] and 0 <= ny < q.shape[1] and 0 <= n_x < q.shape[2]:
-                    if parenchymal_mask[nz, ny, n_x]:
-                        neighbors.append(float(q[nz, ny, n_x]))
+                nz, ny, nx = z + dz, y + dy, x + dx
+                if 0 <= nz < q.shape[0] and 0 <= ny < q.shape[1] and 0 <= nx < q.shape[2]:
+                    if parenchymal_mask[nz, ny, nx]:
+                        neighbors.append(float(q[nz, ny, nx]))
             if neighbors:
                 n_i[g] += 1
                 s_i[g] += abs(float(g) - np.mean(neighbors))
