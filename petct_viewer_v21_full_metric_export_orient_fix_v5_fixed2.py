@@ -4930,6 +4930,44 @@ class BreastSegmentor:
 
         return _bd_remove_small_objects(cleaned, min_size=100)
 
+    def compute_exclusion_masks(self, ct_volume: np.ndarray, breast_mask: np.ndarray) -> dict:
+        """Return a dict of sub-tissue boolean masks for a single breast ROI.
+
+        Keys
+        ----
+        ``skin``        — 2-voxel shell at the breast boundary
+        ``pectoralis``  — posterior-region HU >40 (muscle) within the breast boundary
+        ``clips``       — small high-HU objects (HU > 400) — metal clips / calcifications
+        ``vessels``     — thin bright strands (HU 80–400) excluded after clip removal
+        """
+        inner = _bd_ndi.binary_erosion(breast_mask, iterations=2)
+        skin = breast_mask & ~inner
+
+        posterior_region = np.zeros(ct_volume.shape, dtype=bool)
+        posterior_start = int(ct_volume.shape[1] * 0.66)
+        posterior_region[:, posterior_start:, :] = True
+        pectoralis = posterior_region & (ct_volume > _BD_HU_MUSCLE_MIN) & breast_mask
+
+        clips_raw = (ct_volume > _BD_HU_CLIP_MIN) & breast_mask
+        labels, n_labels = _bd_ndi.label(clips_raw)
+        clips = np.zeros_like(clips_raw)
+        if n_labels:
+            sizes = np.bincount(labels.ravel())
+            small_ids = np.nonzero(sizes[1:] <= 500)[0] + 1
+            if small_ids.size:
+                clips = np.isin(labels, small_ids)
+
+        # Vessels: bright soft-tissue strands (HU 80–400) not already assigned to pectoralis/clips
+        vessels = (ct_volume >= 80) & (ct_volume <= _BD_HU_CLIP_MIN) & breast_mask & ~pectoralis & ~clips
+        vessels = _bd_remove_small_objects(vessels.astype(bool), min_size=20)
+
+        return {
+            "skin": skin.astype(bool),
+            "pectoralis": pectoralis.astype(bool),
+            "clips": clips.astype(bool),
+            "vessels": vessels.astype(bool),
+        }
+
 
 # --- Density Engine ---
 class BreastCTDensityEngine:
@@ -5408,6 +5446,7 @@ class V21BreastDensityTab(QtWidgets.QWidget):
         self._roi_left: Optional[np.ndarray] = None           # manually labelled left breast ROI
         self._roi_right: Optional[np.ndarray] = None          # manually labelled right breast ROI
         self._roi_tumor_exclusion: Optional[np.ndarray] = None  # user-drawn tumor exclusion ROI
+        self._excl_detail_masks: dict = {}    # per-side skin/pectoralis/clips/vessels (for figure export)
         self._worker: Optional[_BreastWorker] = None          # background computation thread
         self._build()
 
@@ -5543,6 +5582,26 @@ class V21BreastDensityTab(QtWidgets.QWidget):
         self._btn_export.setEnabled(False)
         self._btn_export.clicked.connect(self._on_export_csv)
         btn_row.addWidget(self._btn_export)
+
+        self._btn_export_fig = QtWidgets.QPushButton("📸  Export Segmentation Figure")
+        self._btn_export_fig.setEnabled(False)
+        self._btn_export_fig.setToolTip(
+            "Save a publication-quality PNG figure (300 DPI) with all segmentation layers "
+            "rendered in distinct colours over representative CT slices.\n\n"
+            "Colour scheme:\n"
+            "  Whole breast (R)      — cyan\n"
+            "  Whole breast (L)      — steel-blue\n"
+            "  Fibroglandular (R)    — orange\n"
+            "  Fibroglandular (L)    — gold\n"
+            "  Skin shell            — olive-green\n"
+            "  Pectoralis muscle     — magenta\n"
+            "  Metal clips / calcif. — yellow\n"
+            "  Blood vessels         — lime-green\n"
+            "  Tumor exclusion zone  — red\n\n"
+            "Run 'Segment Fibroglandular Tissue' or 'Compute Density (Auto)' first."
+        )
+        self._btn_export_fig.clicked.connect(self._on_export_figure)
+        btn_row.addWidget(self._btn_export_fig)
         btn_row.addStretch()
         seg_lay.addLayout(btn_row)
         root.addWidget(seg_grp)
@@ -5832,6 +5891,7 @@ class V21BreastDensityTab(QtWidgets.QWidget):
             segmentor = BreastSegmentor()
             results: dict = {}
             fg_masks: dict = {}
+            excl_detail: dict = {}
             for side, roi in (("right", roi_right), ("left", roi_left)):
                 if roi is None:
                     continue
@@ -5847,6 +5907,7 @@ class V21BreastDensityTab(QtWidgets.QWidget):
                 fg_vol_cc = float(np.sum(fg_clean)) * vox_cc
                 fat_vol_cc = max(0.0, whole_vol_cc - fg_vol_cc)
                 fg_masks[side] = fg_clean
+                excl_detail[side] = segmentor.compute_exclusion_masks(ct_snap, roi)
                 results.update({
                     f"{side}_breast_roi_vol_cc": round(whole_vol_cc, 3),
                     f"{side}_fibroglandular_vol_cc": round(fg_vol_cc, 3),
@@ -5871,7 +5932,7 @@ class V21BreastDensityTab(QtWidgets.QWidget):
                         abs(results["right_volumetric_density_pct"] -
                             results["left_volumetric_density_pct"]), 3),
                 })
-            return {"results": results, "fg_masks": fg_masks}
+            return {"results": results, "fg_masks": fg_masks, "excl_detail": excl_detail}
 
         self._log_msg("[FG] Running fibroglandular segmentation on labelled ROIs …")
         self._set_busy(True, "Segmenting fibroglandular tissue … please wait")
@@ -5885,6 +5946,7 @@ class V21BreastDensityTab(QtWidgets.QWidget):
         results = payload.get("results", {})
         fg_masks = payload.get("fg_masks", {})
         self._fg_masks = fg_masks
+        self._excl_detail_masks = payload.get("excl_detail", {})
         self._density_results = results
         self._fill_table(self._density_table, results)
         self._result_tabs.setCurrentIndex(0)
@@ -5893,6 +5955,7 @@ class V21BreastDensityTab(QtWidgets.QWidget):
             fg_union = m if fg_union is None else (fg_union | m)
         self._parenchymal_mask = fg_union
         self._btn_export.setEnabled(True)
+        self._btn_export_fig.setEnabled(BREAST_ML_DEPS_AVAILABLE)  # needs matplotlib
         self._push_seg_overlays()
         for side, mask in fg_masks.items():
             spacing = getattr(self._app, "spacing_zyx", (1.0, 1.0, 1.0))
@@ -5926,6 +5989,7 @@ class V21BreastDensityTab(QtWidgets.QWidget):
             vox_cc = float(np.prod(voxel_spacing_mm) / 1000.0)
             fg_masks: dict = {}
             results: dict = {}
+            excl_detail: dict = {}
             for side in ("right", "left"):
                 breast_mask = whole_masks[f"{side}_mask"]
                 fg_raw = segmentor.segment_fibroglandular(ct_snap, breast_mask)
@@ -5934,6 +5998,7 @@ class V21BreastDensityTab(QtWidgets.QWidget):
                 if tumor_excl is not None:
                     fg_clean = fg_clean & ~tumor_excl
                 fg_masks[side] = fg_clean
+                excl_detail[side] = segmentor.compute_exclusion_masks(ct_snap, breast_mask)
                 whole_vol_cc = float(np.sum(breast_mask)) * vox_cc
                 fg_vol_cc = float(np.sum(fg_clean)) * vox_cc
                 fat_vol_cc = max(0.0, whole_vol_cc - fg_vol_cc)
@@ -5960,7 +6025,8 @@ class V21BreastDensityTab(QtWidgets.QWidget):
                     abs(results["right_volumetric_density_pct"] -
                         results["left_volumetric_density_pct"]), 3),
             })
-            return {"results": results, "fg_masks": fg_masks, "whole_masks": whole_masks}
+            return {"results": results, "fg_masks": fg_masks, "whole_masks": whole_masks,
+                    "excl_detail": excl_detail}
 
         self._log_msg("[Density] Starting auto-segmentation …")
         self._set_busy(True, "Auto-segmenting whole breast + fibroglandular tissue … please wait")
@@ -5975,6 +6041,7 @@ class V21BreastDensityTab(QtWidgets.QWidget):
         fg_masks = payload.get("fg_masks", {})
         whole_masks = payload.get("whole_masks", {})
         self._fg_masks = fg_masks
+        self._excl_detail_masks = payload.get("excl_detail", {})
         self._whole_masks = whole_masks
         self._density_results = results
         self._fill_table(self._density_table, results)
@@ -5982,6 +6049,7 @@ class V21BreastDensityTab(QtWidgets.QWidget):
         if "right" in fg_masks and "left" in fg_masks:
             self._parenchymal_mask = fg_masks["right"] | fg_masks["left"]
         self._btn_export.setEnabled(True)
+        self._btn_export_fig.setEnabled(BREAST_ML_DEPS_AVAILABLE)  # needs matplotlib
         self._push_seg_overlays()
         for side in ("right", "left"):
             self._log_msg(f"[Density] {side.upper()}: "
@@ -6105,6 +6173,196 @@ class V21BreastDensityTab(QtWidgets.QWidget):
             self._log_msg(f"[Export] Saved to {path}")
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "Export Error", str(exc))
+
+    # ------------------------------------------------------------------
+    def _on_export_figure(self):
+        """Export a publication-quality segmentation figure (300 DPI PNG/SVG).
+
+        Colour scheme
+        -------------
+        Whole breast (R)        cyan          (0,   200, 200)
+        Whole breast (L)        steel-blue    (70,  130, 180)
+        Fibroglandular (R)      orange        (255, 140, 0)
+        Fibroglandular (L)      gold          (220, 200, 0)
+        Skin shell              olive-green   (107, 142, 35)
+        Pectoralis muscle       magenta       (200, 0,   200)
+        Metal clips / calcif.   yellow        (255, 255, 0)
+        Blood vessels           lime-green    (0,   230, 115)
+        Tumor exclusion zone    red           (220, 30,  30)
+        """
+        if not BREAST_ML_DEPS_AVAILABLE:
+            QtWidgets.QMessageBox.warning(
+                self, "Export Figure",
+                "matplotlib is required for figure export.\n"
+                "Install with:  pip install matplotlib"
+            )
+            return
+        ct_hu = getattr(self._app, "ct_hu", None)
+        if ct_hu is None:
+            QtWidgets.QMessageBox.warning(self, "Export Figure", "No CT volume loaded.")
+            return
+        if not self._fg_masks:
+            QtWidgets.QMessageBox.warning(
+                self, "Export Figure",
+                "No segmentation results yet.\n"
+                "Run 'Segment Fibroglandular Tissue' or 'Compute Density (Auto)' first."
+            )
+            return
+
+        path, fmt = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save Segmentation Figure",
+            "breast_segmentation_figure.png",
+            "PNG image (*.png);;SVG vector (*.svg);;TIFF image (*.tif)"
+        )
+        if not path:
+            return
+
+        # Collect masks (all optional)
+        right_whole = self._whole_masks.get("right_mask") or self._roi_right
+        left_whole  = self._whole_masks.get("left_mask")  or self._roi_left
+        right_fg    = self._fg_masks.get("right")
+        left_fg     = self._fg_masks.get("left")
+        tumor_excl  = self._roi_tumor_exclusion
+
+        def _get_side_detail(side: str, key: str):
+            d = self._excl_detail_masks.get(side)
+            return d.get(key) if d else None
+
+        # Determine representative axial slices to show — one per active side plus bilateral
+        slice_specs: list = []
+        for label, whole_mask in (("RIGHT", right_whole), ("LEFT", left_whole)):
+            if whole_mask is not None and whole_mask.any():
+                z_indices = np.where(np.any(whole_mask, axis=(1, 2)))[0]
+                if z_indices.size:
+                    z_center = int(z_indices[len(z_indices) // 2])
+                    slice_specs.append((label, z_center))
+        # Add a mid-volume bilateral slice if both sides are present
+        if right_whole is not None and left_whole is not None:
+            combined = right_whole | left_whole
+            if combined.any():
+                z_indices = np.where(np.any(combined, axis=(1, 2)))[0]
+                if z_indices.size:
+                    z_center = int(z_indices[len(z_indices) // 2])
+                    slice_specs.append(("BILATERAL", z_center))
+
+        if not slice_specs:
+            QtWidgets.QMessageBox.warning(self, "Export Figure", "Could not determine representative slices.")
+            return
+
+        # Layer definition: (mask_or_None, rgba_0_1, legend_label)
+        # RGBA alpha chosen for readability: dense masks lower alpha, exclusion higher
+        def _norm(mask):
+            """Return mask as float array [0,1] or None."""
+            return mask.astype(float) if mask is not None else None
+
+        try:
+            import matplotlib as _mpl
+            _mpl.use("Agg")
+            import matplotlib.pyplot as plt
+            import matplotlib.patches as mpatches
+            from matplotlib.colors import ListedColormap
+
+            n_panels = len(slice_specs)
+            fig, axes = plt.subplots(1, n_panels,
+                                     figsize=(6.5 * n_panels, 6.5),
+                                     dpi=300,
+                                     facecolor="white")
+            if n_panels == 1:
+                axes = [axes]
+
+            # HU window: breast soft tissue window
+            hu_lo, hu_hi = -300.0, 200.0
+
+            legend_handles = []
+            legend_added: set = set()
+
+            def _add_legend(colour_rgba, label):
+                if label not in legend_added:
+                    legend_added.add(label)
+                    patch = mpatches.Patch(color=colour_rgba, label=label, alpha=0.85)
+                    legend_handles.append(patch)
+
+            def _overlay(ax, mask_3d, z, rgba):
+                """Blend a single boolean mask as a solid-colour RGBA overlay."""
+                if mask_3d is None:
+                    return
+                sl = mask_3d[z].astype(bool)
+                if not sl.any():
+                    return
+                h, w = sl.shape
+                img = np.zeros((h, w, 4), dtype=np.float32)
+                img[sl, 0] = rgba[0]
+                img[sl, 1] = rgba[1]
+                img[sl, 2] = rgba[2]
+                img[sl, 3] = rgba[3]
+                ax.imshow(img, origin="upper", aspect="equal", interpolation="none")
+
+            # Layer table: (mask_getter, RGBA, legend_label)
+            layers = [
+                (right_whole, (0.00, 0.78, 0.78, 0.35), "Whole breast (R)"),
+                (left_whole,  (0.27, 0.51, 0.71, 0.35), "Whole breast (L)"),
+                (_get_side_detail("right", "skin"),       (0.42, 0.56, 0.14, 0.50), "Skin shell"),
+                (_get_side_detail("left",  "skin"),       (0.42, 0.56, 0.14, 0.50), "Skin shell"),
+                (_get_side_detail("right", "pectoralis"), (0.78, 0.00, 0.78, 0.60), "Pectoralis muscle"),
+                (_get_side_detail("left",  "pectoralis"), (0.78, 0.00, 0.78, 0.60), "Pectoralis muscle"),
+                (_get_side_detail("right", "clips"),      (1.00, 1.00, 0.00, 0.80), "Clips / calcifications"),
+                (_get_side_detail("left",  "clips"),      (1.00, 1.00, 0.00, 0.80), "Clips / calcifications"),
+                (_get_side_detail("right", "vessels"),    (0.00, 0.90, 0.45, 0.65), "Blood vessels"),
+                (_get_side_detail("left",  "vessels"),    (0.00, 0.90, 0.45, 0.65), "Blood vessels"),
+                (right_fg,    (1.00, 0.55, 0.00, 0.70), "Fibroglandular (R)"),
+                (left_fg,     (0.86, 0.78, 0.00, 0.70), "Fibroglandular (L)"),
+                (tumor_excl,  (0.86, 0.12, 0.12, 0.80), "Tumor exclusion zone"),
+            ]
+
+            for ax, (panel_label, z) in zip(axes, slice_specs):
+                ct_slice = ct_hu[z].astype(float)
+                ct_norm = np.clip((ct_slice - hu_lo) / (hu_hi - hu_lo), 0.0, 1.0)
+                ax.imshow(ct_norm, cmap="gray", origin="upper", aspect="equal",
+                          interpolation="bilinear", vmin=0.0, vmax=1.0)
+
+                for mask, rgba, lbl in layers:
+                    _overlay(ax, mask, z, rgba)
+                    if mask is not None and mask[z].any():
+                        _add_legend(rgba, lbl)
+
+                spacing_zyx = getattr(self._app, "spacing_zyx", (1.0, 1.0, 1.0))
+                ax.set_title(
+                    f"{panel_label}  —  axial slice z={z}\n"
+                    f"(z-spacing {float(spacing_zyx[0]):.2f} mm)",
+                    fontsize=9, fontweight="bold", color="#1a1a2e"
+                )
+                ax.axis("off")
+
+            # Shared legend
+            if legend_handles:
+                fig.legend(
+                    handles=legend_handles,
+                    loc="lower center",
+                    ncol=min(len(legend_handles), 5),
+                    fontsize=8,
+                    framealpha=0.9,
+                    edgecolor="#aaaaaa",
+                    bbox_to_anchor=(0.5, -0.04),
+                )
+
+            fig.suptitle("Breast CT Segmentation — Tissue Layers", fontsize=12,
+                         fontweight="bold", y=1.01, color="#1a1a2e")
+            fig.tight_layout(rect=[0, 0.06, 1, 1])
+
+            ext = path.rsplit(".", 1)[-1].lower() if "." in path else "png"
+            fig.savefig(path, dpi=300, bbox_inches="tight",
+                        format=ext if ext in ("png", "svg", "tif", "tiff", "pdf") else "png",
+                        facecolor="white")
+            plt.close(fig)
+            self._log_msg(f"[Figure] Saved to {path}")
+            QtWidgets.QMessageBox.information(
+                self, "Export Figure",
+                f"Segmentation figure saved:\n{path}\n\n"
+                f"Panels: {', '.join(lbl for lbl, _ in slice_specs)}"
+            )
+        except Exception as exc:
+            self._log_msg(f"[Figure] ERROR: {exc}")
+            QtWidgets.QMessageBox.critical(self, "Export Figure Error", str(exc))
 
     def _on_browse_csv(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
