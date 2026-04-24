@@ -6178,6 +6178,33 @@ class V21BreastDensityTab(QtWidgets.QWidget):
         self._lbl_roi_status.setStyleSheet("color: #5d6d7e; font-style: italic;")
         label_lay.addWidget(self._lbl_roi_status)
 
+        # ── Paint helpers row (within Step 1) ──────────────────────────
+        paint_help_row = QtWidgets.QHBoxLayout()
+
+        self._btn_paint_tumor = QtWidgets.QPushButton("🎨  Paint Tumor")
+        self._btn_paint_tumor.setToolTip(
+            "Clears the current viewer paint canvas and activates Paint mode so you can\n"
+            "draw the tumor region from scratch.\n\n"
+            "Workflow:\n"
+            "  1. Label both breasts (Label as LEFT / RIGHT) first — those ROIs are stored separately.\n"
+            "  2. Click this button to clear the canvas and switch to Paint mode.\n"
+            "  3. Paint the tumor region.\n"
+            "  4. Click '🚫 Mark Tumor Exclusion ROI' to register it."
+        )
+        self._btn_paint_tumor.setStyleSheet("QPushButton { color: #1a7a1a; font-weight: bold; }")
+        self._btn_paint_tumor.clicked.connect(self._on_paint_tumor)
+        paint_help_row.addWidget(self._btn_paint_tumor)
+
+        self._btn_clear_viewer_paint = QtWidgets.QPushButton("🗑  Clear Viewer Paint")
+        self._btn_clear_viewer_paint.setToolTip(
+            "Zeroes the viewer paint canvas (the ROI drawn with Paint / Lasso).\n"
+            "Stored breast ROI labels (Left / Right) and Tumor Exclusion ROI are NOT affected."
+        )
+        self._btn_clear_viewer_paint.clicked.connect(self._on_clear_viewer_paint)
+        paint_help_row.addWidget(self._btn_clear_viewer_paint)
+        paint_help_row.addStretch()
+        label_lay.addLayout(paint_help_row)
+
         # ── Tumor exclusion ROI row (within Step 1) ─────────────────────
         tumor_row = QtWidgets.QHBoxLayout()
 
@@ -6503,6 +6530,48 @@ class V21BreastDensityTab(QtWidgets.QWidget):
             if v is not None and hasattr(v, "set_seg_overlays"):
                 v.set_seg_overlays({})
         self._log_msg("[ROI] Left / right labels cleared.")
+
+    def _on_paint_tumor(self):
+        """Clear the viewer paint canvas and activate Paint mode for tumor drawing."""
+        mask = getattr(self._app, "mask", None)
+        if mask is None:
+            QtWidgets.QMessageBox.warning(
+                self, "No Study Loaded",
+                "Please load a PET/CT study before using the paint tools."
+            )
+            return
+        mask[:] = False
+        mask_primary = getattr(self._app, "mask_primary", None)
+        if mask_primary is not None and mask_primary is not mask:
+            mask_primary[:] = False
+        try:
+            self._app._set_mode("paint")
+        except Exception:
+            pass
+        try:
+            self._app._refresh_all_views()
+        except Exception:
+            pass
+        self._log_msg("[Paint] Viewer paint cleared — Paint mode activated. Draw the tumor region.")
+
+    def _on_clear_viewer_paint(self):
+        """Zero the viewer paint canvas without touching stored breast or tumor ROIs."""
+        mask = getattr(self._app, "mask", None)
+        if mask is None:
+            QtWidgets.QMessageBox.warning(
+                self, "No Study Loaded",
+                "Please load a PET/CT study before using the paint tools."
+            )
+            return
+        mask[:] = False
+        mask_primary = getattr(self._app, "mask_primary", None)
+        if mask_primary is not None and mask_primary is not mask:
+            mask_primary[:] = False
+        try:
+            self._app._refresh_all_views()
+        except Exception:
+            pass
+        self._log_msg("[Paint] Viewer paint canvas cleared.")
 
     def _on_label_tumor_exclusion(self):
         """Snapshot the current viewer ROI mask as the tumor exclusion zone."""
