@@ -6518,26 +6518,32 @@ class V21BreastDensityTab(QtWidgets.QWidget):
             return
         snap = roi_mask.astype(bool).copy()
 
-        # Warn the user if the tumor exclusion zone is suspiciously large
-        # (covers more than 50 % of any stored breast ROI).
-        warning_sides = []
+        # Block saving if the drawn region covers more than 30 % of any breast ROI —
+        # this prevents the common mistake of re-using the full breast ROI as the
+        # tumor exclusion zone.  The user must draw a tight region around the lesion.
+        blocked_sides = []
         for side_label, breast_roi in (("Right", self._roi_right), ("Left", self._roi_left)):
             if breast_roi is not None and breast_roi.any():
                 overlap = int(np.sum(snap & breast_roi.astype(bool)))
                 breast_total = int(np.sum(breast_roi))
-                if breast_total > 0 and overlap / breast_total > 0.50:
-                    warning_sides.append(
-                        f"{side_label}: {overlap}/{breast_total} vox ({100*overlap/breast_total:.0f} %)"
+                if breast_total > 0 and overlap / breast_total > 0.30:
+                    blocked_sides.append(
+                        f"{side_label}: ROI covers {100*overlap/breast_total:.0f} % "
+                        f"({overlap}/{breast_total} vox)"
                     )
-        if warning_sides:
-            QtWidgets.QMessageBox.warning(
-                self, "Tumor Exclusion ROI — Large Region",
-                "The drawn ROI covers more than 50 % of the following breast ROI(s):\n\n"
-                + "\n".join(warning_sides)
-                + "\n\nAre you sure this is only the tumour / clip region?\n"
-                "If not, clear the existing breast ROI, draw a smaller region around the "
-                "tumour, and click 'Mark Tumor Exclusion ROI' again."
+        if blocked_sides:
+            QtWidgets.QMessageBox.critical(
+                self, "Tumor Exclusion ROI — Region Too Large",
+                "The drawn ROI covers more than 30 % of the following breast ROI(s):\n\n"
+                + "\n".join(blocked_sides)
+                + "\n\nThe tumor exclusion zone must be a tight region around the tumour "
+                "only — not the whole breast.\n\n"
+                "Steps to fix:\n"
+                "  1. Clear the current viewer mask (paint/lasso clear).\n"
+                "  2. Draw a small region that covers only the tumour / clip area.\n"
+                "  3. Click 'Mark Tumor Exclusion ROI' again."
             )
+            return
 
         self._roi_tumor_exclusion = snap
         self._log_msg(f"[ROI] Tumor exclusion ROI set — {int(np.sum(snap))} voxels will be subtracted from FG mask.")
@@ -7040,7 +7046,21 @@ class V21BreastDensityTab(QtWidgets.QWidget):
                 else:
                     return mask_3d[:, :, idx].astype(bool)
 
-            def _overlay_2d(ax, sl_2d, rgba):
+            # Pixel aspect ratios per orientation so that anatomical proportions are
+            # preserved when voxels are anisotropic (e.g. z-spacing >> x/y-spacing).
+            #   axial    (Y rows, X cols): aspect = sy / sx
+            #   coronal  (Z rows, X cols): aspect = sz / sx
+            #   sagittal (Z rows, Y cols): aspect = sz / sy
+            sz = float(spacing_zyx[0])
+            sy = float(spacing_zyx[1])
+            sx = float(spacing_zyx[2])
+            orient_pixel_aspect = {
+                0: sy / sx if sx > 0 else 1.0,
+                1: sz / sx if sx > 0 else 1.0,
+                2: sz / sy if sy > 0 else 1.0,
+            }
+
+            def _overlay_2d(ax, sl_2d, rgba, pix_aspect=1.0):
                 """Blend a 2-D boolean slice as a solid-colour RGBA overlay."""
                 if sl_2d is None or not sl_2d.any():
                     return
@@ -7050,27 +7070,31 @@ class V21BreastDensityTab(QtWidgets.QWidget):
                 img[sl_2d, 1] = rgba[1]
                 img[sl_2d, 2] = rgba[2]
                 img[sl_2d, 3] = rgba[3]
-                ax.imshow(img, origin="upper", aspect="equal", interpolation="none")
+                ax.imshow(img, origin="upper", aspect=pix_aspect, interpolation="none")
 
             # Layer table: (mask_3d, RGBA, legend_label)
-            # Skin alpha raised to 0.70 for better visibility.
+            # Rendering order matters: layers drawn later appear on top.
+            # Tumor exclusion zone is placed FIRST (background) so that the
+            # sub-tissue layers (skin, pectoralis, fibroglandular) remain visible
+            # on top of the excluded region.  Its alpha is kept semi-transparent.
             layers = [
-                (right_whole, (0.00, 0.78, 0.78, 0.35), "Whole breast (R)"),
-                (left_whole,  (0.27, 0.51, 0.71, 0.35), "Whole breast (L)"),
-                (_get_side_detail("right", "skin"),       (0.42, 0.56, 0.14, 0.70), "Skin shell"),
-                (_get_side_detail("left",  "skin"),       (0.42, 0.56, 0.14, 0.70), "Skin shell"),
-                (_get_side_detail("right", "pectoralis"), (0.78, 0.00, 0.78, 0.70), "Pectoralis muscle"),
-                (_get_side_detail("left",  "pectoralis"), (0.78, 0.00, 0.78, 0.70), "Pectoralis muscle"),
-                (_get_side_detail("right", "clips"),      (1.00, 1.00, 0.00, 0.80), "Clips / calcifications"),
-                (_get_side_detail("left",  "clips"),      (1.00, 1.00, 0.00, 0.80), "Clips / calcifications"),
-                (_get_side_detail("right", "vessels"),    (0.00, 0.90, 0.45, 0.65), "Blood vessels"),
-                (_get_side_detail("left",  "vessels"),    (0.00, 0.90, 0.45, 0.65), "Blood vessels"),
-                (right_fg,    (1.00, 0.55, 0.00, 0.75), "Fibroglandular (R)"),
-                (left_fg,     (0.86, 0.78, 0.00, 0.75), "Fibroglandular (L)"),
-                (tumor_excl,  (0.86, 0.12, 0.12, 0.80), "Tumor exclusion zone"),
+                (right_whole, (0.00, 0.78, 0.78, 0.30), "Whole breast (R)"),
+                (left_whole,  (0.27, 0.51, 0.71, 0.30), "Whole breast (L)"),
+                (tumor_excl,  (0.86, 0.12, 0.12, 0.55), "Tumor exclusion zone"),
+                (_get_side_detail("right", "skin"),       (0.42, 0.56, 0.14, 0.75), "Skin shell"),
+                (_get_side_detail("left",  "skin"),       (0.42, 0.56, 0.14, 0.75), "Skin shell"),
+                (_get_side_detail("right", "pectoralis"), (0.78, 0.00, 0.78, 0.75), "Pectoralis muscle"),
+                (_get_side_detail("left",  "pectoralis"), (0.78, 0.00, 0.78, 0.75), "Pectoralis muscle"),
+                (_get_side_detail("right", "clips"),      (1.00, 1.00, 0.00, 0.85), "Clips / calcifications"),
+                (_get_side_detail("left",  "clips"),      (1.00, 1.00, 0.00, 0.85), "Clips / calcifications"),
+                (_get_side_detail("right", "vessels"),    (0.00, 0.90, 0.45, 0.70), "Blood vessels"),
+                (_get_side_detail("left",  "vessels"),    (0.00, 0.90, 0.45, 0.70), "Blood vessels"),
+                (right_fg,    (1.00, 0.55, 0.00, 0.80), "Fibroglandular (R)"),
+                (left_fg,     (0.86, 0.78, 0.00, 0.80), "Fibroglandular (L)"),
             ]
 
             for r_idx, (orient_name, orient_axis, ax_letter, sp_mm) in enumerate(orientations):
+                pix_aspect = orient_pixel_aspect[orient_axis]
                 for c_idx, side_label in enumerate(side_labels):
                     ax = axes[r_idx, c_idx]
                     z_c, y_c, x_c = side_centroids[side_label]
@@ -7079,12 +7103,12 @@ class V21BreastDensityTab(QtWidgets.QWidget):
 
                     ct_sl = _get_ct_slice(orient_axis, slice_idx)
                     ct_norm = np.clip((ct_sl - hu_lo) / (hu_hi - hu_lo), 0.0, 1.0)
-                    ax.imshow(ct_norm, cmap="gray", origin="upper", aspect="equal",
+                    ax.imshow(ct_norm, cmap="gray", origin="upper", aspect=pix_aspect,
                               interpolation="bilinear", vmin=0.0, vmax=1.0)
 
                     for mask, rgba, lbl in layers:
                         sl_2d = _get_mask_slice(mask, orient_axis, slice_idx)
-                        _overlay_2d(ax, sl_2d, rgba)
+                        _overlay_2d(ax, sl_2d, rgba, pix_aspect)
                         if sl_2d is not None and sl_2d.any():
                             _add_legend(rgba, lbl)
 
