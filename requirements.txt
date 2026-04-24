@@ -1,0 +1,27 @@
+# Core GUI / imaging
+PyQt6>=6.4
+pyqtgraph>=0.13
+pydicom>=2.3
+SimpleITK>=2.3
+numpy>=1.24
+
+# Breast-density module — required
+scipy>=1.10
+scikit-image>=0.21
+
+# Breast-density module — radiomics
+pyradiomics>=3.0
+
+# TotalSegmentator — required for precise thoracic constraint boundaries.
+# Without this the breast segmentor falls back to a HU-based diaphragm
+# heuristic that is less accurate.  Install with:
+#   pip install totalsegmentator nibabel
+# TotalSegmentator pulls in torch automatically; a CUDA-capable GPU is
+# optional but speeds up inference significantly.
+totalsegmentator>=2.0
+nibabel>=5.0
+
+# Optional ML / analysis
+pandas>=2.0
+matplotlib>=3.7
+scikit-learn>=1.3

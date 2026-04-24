@@ -4840,19 +4840,43 @@ try:
 except Exception:
     BREAST_ML_DEPS_AVAILABLE = False
 
-# --- Optional TotalSegmentator integration ---
-# When installed, TotalSegmentator is used to derive precise anatomical
-# boundaries (diaphragm Z-plane from lung lobes, posterior Y-boundary from
-# thoracic vertebrae) that replace the HU-based heuristics.  The application
-# loads and runs normally without it.
+# --- TotalSegmentator integration ---
+# TotalSegmentator is REQUIRED for precise anatomical constraints.
+# It derives the diaphragm Z-plane from real lung-lobe segmentations and the
+# posterior Y-boundary from thoracic-vertebra segmentations.  Without it the
+# breast segmentor falls back to a cruder HU-based heuristic that can extend
+# below the diaphragm on difficult cases.
+#
+# Install once with:
+#   pip install totalsegmentator nibabel
+# (TotalSegmentator pulls in PyTorch automatically.)
 try:
     from totalsegmentator.python_api import totalsegmentator as _bd_ts_api
     import nibabel as _bd_nib
     _BD_TS_AVAILABLE = True
-except Exception:
+except Exception as _bd_ts_import_exc:
     _BD_TS_AVAILABLE = False
     _bd_ts_api = None   # type: ignore[assignment]
     _bd_nib = None      # type: ignore[assignment]
+    import sys as _sys
+    print(
+        "\n"
+        "╔══════════════════════════════════════════════════════════════════╗\n"
+        "║  WARNING: TotalSegmentator / nibabel not found                  ║\n"
+        "║                                                                  ║\n"
+        "║  The breast segmentor will fall back to a HU-based heuristic    ║\n"
+        "║  that is less accurate and may extend below the diaphragm on    ║\n"
+        "║  difficult cases.                                                ║\n"
+        "║                                                                  ║\n"
+        "║  Install the required packages with:                            ║\n"
+        "║      pip install totalsegmentator nibabel                       ║\n"
+        "║                                                                  ║\n"
+        "║  A CUDA GPU is optional but recommended for fast inference.     ║\n"
+        f"║  Import error: {str(_bd_ts_import_exc)[:50]:<50s} ║\n"
+        "╚══════════════════════════════════════════════════════════════════╝\n",
+        file=_sys.stderr,
+    )
+    del _sys, _bd_ts_import_exc
 
 # --- Constants ---
 _BD_HU_FAT_MAX = -25
@@ -6661,7 +6685,16 @@ class V21BreastDensityTab(QtWidgets.QWidget):
                     "excl_detail": excl_detail,
                     "seg_backend": getattr(segmentor, "_last_seg_backend", "HU-heuristic")}
 
-        ts_note = " (TotalSegmentator)" if _BD_TS_AVAILABLE else " (HU-heuristic fallback — TotalSegmentator not installed)"
+        if _BD_TS_AVAILABLE:
+            ts_note = " (TotalSegmentator — precise thoracic constraints active)"
+        else:
+            ts_note = " (HU-heuristic fallback)"
+            self._log_msg(
+                "[Density] WARNING: TotalSegmentator is NOT installed. "
+                "Breast segmentation will use a less-accurate HU-based diaphragm "
+                "heuristic that may extend below the thorax on some cases. "
+                "Install with:  pip install totalsegmentator nibabel"
+            )
         self._log_msg(f"[Density] Starting auto-segmentation{ts_note} …")
         self._set_busy(True, "Auto-segmenting whole breast + fibroglandular tissue … please wait")
         self._worker = _BreastWorker(_compute)
