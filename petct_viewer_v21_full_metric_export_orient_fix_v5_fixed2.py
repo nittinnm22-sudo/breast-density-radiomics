@@ -5466,9 +5466,22 @@ class BreastSegmentor:
         inner = _bd_ndi.binary_erosion(breast_mask, iterations=2)
         skin = breast_mask & ~inner
 
+        # Pectoralis: posterior 25 % of the breast's own AP (Y) extent, not
+        # the global 50 % of the CT volume.  Using the breast mask's Y span
+        # correctly restricts the pectoralis layer to the back of the breast
+        # mound and avoids labelling structures outside the breast ROI.
         posterior_region = np.zeros(ct_volume.shape, dtype=bool)
-        posterior_start = int(ct_volume.shape[1] * 0.50)
-        posterior_region[:, posterior_start:, :] = True
+        if breast_mask.any():
+            y_coords = np.where(breast_mask.any(axis=(0, 2)))[0]
+            if y_coords.size >= 2:
+                y_ant = int(y_coords.min())
+                y_post = int(y_coords.max())
+                y_pec_thresh = y_ant + max(1, int((y_post - y_ant) * 0.75))
+            else:
+                y_pec_thresh = int(ct_volume.shape[1] * 0.50)
+        else:
+            y_pec_thresh = int(ct_volume.shape[1] * 0.50)
+        posterior_region[:, y_pec_thresh:, :] = True
         pectoralis = posterior_region & (ct_volume > _BD_HU_MUSCLE_MIN) & breast_mask
 
         clips_raw = (ct_volume > _BD_HU_CLIP_MIN) & breast_mask
@@ -6504,6 +6517,28 @@ class V21BreastDensityTab(QtWidgets.QWidget):
             )
             return
         snap = roi_mask.astype(bool).copy()
+
+        # Warn the user if the tumor exclusion zone is suspiciously large
+        # (covers more than 50 % of any stored breast ROI).
+        warning_sides = []
+        for side_label, breast_roi in (("Right", self._roi_right), ("Left", self._roi_left)):
+            if breast_roi is not None and breast_roi.any():
+                overlap = int(np.sum(snap & breast_roi.astype(bool)))
+                breast_total = int(np.sum(breast_roi))
+                if breast_total > 0 and overlap / breast_total > 0.50:
+                    warning_sides.append(
+                        f"{side_label}: {overlap}/{breast_total} vox ({100*overlap/breast_total:.0f} %)"
+                    )
+        if warning_sides:
+            QtWidgets.QMessageBox.warning(
+                self, "Tumor Exclusion ROI — Large Region",
+                "The drawn ROI covers more than 50 % of the following breast ROI(s):\n\n"
+                + "\n".join(warning_sides)
+                + "\n\nAre you sure this is only the tumour / clip region?\n"
+                "If not, clear the existing breast ROI, draw a smaller region around the "
+                "tumour, and click 'Mark Tumor Exclusion ROI' again."
+            )
+
         self._roi_tumor_exclusion = snap
         self._log_msg(f"[ROI] Tumor exclusion ROI set — {int(np.sum(snap))} voxels will be subtracted from FG mask.")
         self._update_roi_status()
@@ -6903,52 +6938,41 @@ class V21BreastDensityTab(QtWidgets.QWidget):
             d = self._excl_detail_masks.get(side)
             return d.get(key) if d else None
 
-        # Determine representative axial slices to show — one per active side plus bilateral
-        slice_specs: list = []
-        for label, whole_mask in (("RIGHT", right_whole), ("LEFT", left_whole)):
-            if whole_mask is not None and whole_mask.any():
-                z_indices = np.where(np.any(whole_mask, axis=(1, 2)))[0]
-                if z_indices.size:
-                    z_center = int(z_indices[len(z_indices) // 2])
-                    slice_specs.append((label, z_center))
-        # Fallback: derive from fibroglandular masks when no whole-breast mask is available
-        if not slice_specs:
-            for label, fg_mask in (("RIGHT", right_fg), ("LEFT", left_fg)):
-                if fg_mask is not None and fg_mask.any():
-                    z_indices = np.where(np.any(fg_mask, axis=(1, 2)))[0]
-                    if z_indices.size:
-                        z_center = int(z_indices[len(z_indices) // 2])
-                        slice_specs.append((label, z_center))
-        # Add a mid-volume bilateral slice if both sides are present
-        if right_whole is not None and left_whole is not None:
-            combined = right_whole | left_whole
-            if combined.any():
-                z_indices = np.where(np.any(combined, axis=(1, 2)))[0]
-                if z_indices.size:
-                    z_center = int(z_indices[len(z_indices) // 2])
-                    slice_specs.append(("BILATERAL", z_center))
-        # De-duplicate slices (bilateral may coincide with a single-side centroid)
-        seen_z: set = set()
-        unique_specs: list = []
-        for spec in slice_specs:
-            if spec[1] not in seen_z:
-                seen_z.add(spec[1])
-                unique_specs.append(spec)
-        slice_specs = unique_specs
+        # Build per-side centroid specs: {label: (z_cent, y_cent, x_cent)}
+        # For each active side we derive the representative slice index for each
+        # orientation (axial→z, coronal→y, sagittal→x) from the breast centroid.
+        def _mask_centroid_indices(mask):
+            """Return (z_c, y_c, x_c) medial indices, or None if mask is empty."""
+            if mask is None or not mask.any():
+                return None
+            z_idx = np.where(mask.any(axis=(1, 2)))[0]
+            y_idx = np.where(mask.any(axis=(0, 2)))[0]
+            x_idx = np.where(mask.any(axis=(0, 1)))[0]
+            if not (z_idx.size and y_idx.size and x_idx.size):
+                return None
+            return (
+                int(z_idx[len(z_idx) // 2]),
+                int(y_idx[len(y_idx) // 2]),
+                int(x_idx[len(x_idx) // 2]),
+            )
 
-        if not slice_specs:
+        side_centroids: dict = {}  # label → (z_c, y_c, x_c)
+        for label, whole_mask in (("RIGHT", right_whole), ("LEFT", left_whole)):
+            c = _mask_centroid_indices(whole_mask)
+            if c is None:
+                # Fallback to fibroglandular mask centroid
+                fg = right_fg if label == "RIGHT" else left_fg
+                c = _mask_centroid_indices(fg)
+            if c is not None:
+                side_centroids[label] = c
+
+        if not side_centroids:
             QtWidgets.QMessageBox.warning(
                 self, "Export Figure",
                 "Could not determine representative slices.\n"
                 "Make sure at least one breast ROI or fibroglandular mask is non-empty."
             )
             return
-
-        # Layer definition: (mask_or_None, rgba_0_1, legend_label)
-        # RGBA alpha chosen for readability: dense masks lower alpha, exclusion higher
-        def _norm(mask):
-            """Return mask as float array [0,1] or None."""
-            return mask.astype(float) if mask is not None else None
 
         try:
             import matplotlib as _mpl
@@ -6959,18 +6983,33 @@ class V21BreastDensityTab(QtWidgets.QWidget):
                     pass  # backend already set; proceed anyway
             import matplotlib.pyplot as plt
             import matplotlib.patches as mpatches
-            from matplotlib.colors import ListedColormap
 
-            n_panels = len(slice_specs)
-            fig, axes = plt.subplots(1, n_panels,
-                                     figsize=(6.5 * n_panels, 6.5),
-                                     dpi=300,
-                                     facecolor="white")
-            if n_panels == 1:
-                axes = [axes]
-
-            # HU window: breast soft tissue window
+            spacing_zyx = getattr(self._app, "spacing_zyx", (1.0, 1.0, 1.0))
+            # HU window: breast soft-tissue window
             hu_lo, hu_hi = -300.0, 200.0
+
+            # ---------------------------------------------------------------
+            # Three orientations × N sides grid
+            # Row 0: Axial    (slice through Z at centroid z)
+            # Row 1: Coronal  (slice through Y at centroid y) — Z rows, X cols
+            # Row 2: Sagittal (slice through X at centroid x) — Z rows, Y cols
+            # ---------------------------------------------------------------
+            orientations = [
+                ("Axial",    0,  "z", float(spacing_zyx[0])),
+                ("Coronal",  1,  "y", float(spacing_zyx[1])),
+                ("Sagittal", 2,  "x", float(spacing_zyx[2])),
+            ]
+            side_labels = list(side_centroids.keys())
+            n_rows = len(orientations)
+            n_cols = len(side_labels)
+
+            fig, axes = plt.subplots(
+                n_rows, n_cols,
+                figsize=(6.5 * n_cols, 6.0 * n_rows),
+                dpi=300,
+                facecolor="white",
+                squeeze=False,
+            )
 
             legend_handles = []
             legend_added: set = set()
@@ -6981,58 +7020,83 @@ class V21BreastDensityTab(QtWidgets.QWidget):
                     patch = mpatches.Patch(color=colour_rgba, label=label, alpha=0.85)
                     legend_handles.append(patch)
 
-            def _overlay(ax, mask_3d, z, rgba):
-                """Blend a single boolean mask as a solid-colour RGBA overlay."""
+            def _get_ct_slice(orient_axis: int, idx: int) -> np.ndarray:
+                """Return a 2-D CT slice for the given orientation and index."""
+                if orient_axis == 0:        # axial: ct[z, :, :]
+                    return ct_hu[idx].astype(float)
+                elif orient_axis == 1:      # coronal: ct[:, y, :]  → (Z, X)
+                    return ct_hu[:, idx, :].astype(float)
+                else:                       # sagittal: ct[:, :, x] → (Z, Y)
+                    return ct_hu[:, :, idx].astype(float)
+
+            def _get_mask_slice(mask_3d, orient_axis: int, idx: int):
+                """Return a 2-D boolean slice for the given orientation and index."""
                 if mask_3d is None:
+                    return None
+                if orient_axis == 0:
+                    return mask_3d[idx].astype(bool)
+                elif orient_axis == 1:
+                    return mask_3d[:, idx, :].astype(bool)
+                else:
+                    return mask_3d[:, :, idx].astype(bool)
+
+            def _overlay_2d(ax, sl_2d, rgba):
+                """Blend a 2-D boolean slice as a solid-colour RGBA overlay."""
+                if sl_2d is None or not sl_2d.any():
                     return
-                sl = mask_3d[z].astype(bool)
-                if not sl.any():
-                    return
-                h, w = sl.shape
+                h, w = sl_2d.shape
                 img = np.zeros((h, w, 4), dtype=np.float32)
-                img[sl, 0] = rgba[0]
-                img[sl, 1] = rgba[1]
-                img[sl, 2] = rgba[2]
-                img[sl, 3] = rgba[3]
+                img[sl_2d, 0] = rgba[0]
+                img[sl_2d, 1] = rgba[1]
+                img[sl_2d, 2] = rgba[2]
+                img[sl_2d, 3] = rgba[3]
                 ax.imshow(img, origin="upper", aspect="equal", interpolation="none")
 
-            # Layer table: (mask_getter, RGBA, legend_label)
+            # Layer table: (mask_3d, RGBA, legend_label)
+            # Skin alpha raised to 0.70 for better visibility.
             layers = [
                 (right_whole, (0.00, 0.78, 0.78, 0.35), "Whole breast (R)"),
                 (left_whole,  (0.27, 0.51, 0.71, 0.35), "Whole breast (L)"),
-                (_get_side_detail("right", "skin"),       (0.42, 0.56, 0.14, 0.50), "Skin shell"),
-                (_get_side_detail("left",  "skin"),       (0.42, 0.56, 0.14, 0.50), "Skin shell"),
-                (_get_side_detail("right", "pectoralis"), (0.78, 0.00, 0.78, 0.60), "Pectoralis muscle"),
-                (_get_side_detail("left",  "pectoralis"), (0.78, 0.00, 0.78, 0.60), "Pectoralis muscle"),
+                (_get_side_detail("right", "skin"),       (0.42, 0.56, 0.14, 0.70), "Skin shell"),
+                (_get_side_detail("left",  "skin"),       (0.42, 0.56, 0.14, 0.70), "Skin shell"),
+                (_get_side_detail("right", "pectoralis"), (0.78, 0.00, 0.78, 0.70), "Pectoralis muscle"),
+                (_get_side_detail("left",  "pectoralis"), (0.78, 0.00, 0.78, 0.70), "Pectoralis muscle"),
                 (_get_side_detail("right", "clips"),      (1.00, 1.00, 0.00, 0.80), "Clips / calcifications"),
                 (_get_side_detail("left",  "clips"),      (1.00, 1.00, 0.00, 0.80), "Clips / calcifications"),
                 (_get_side_detail("right", "vessels"),    (0.00, 0.90, 0.45, 0.65), "Blood vessels"),
                 (_get_side_detail("left",  "vessels"),    (0.00, 0.90, 0.45, 0.65), "Blood vessels"),
-                (right_fg,    (1.00, 0.55, 0.00, 0.70), "Fibroglandular (R)"),
-                (left_fg,     (0.86, 0.78, 0.00, 0.70), "Fibroglandular (L)"),
+                (right_fg,    (1.00, 0.55, 0.00, 0.75), "Fibroglandular (R)"),
+                (left_fg,     (0.86, 0.78, 0.00, 0.75), "Fibroglandular (L)"),
                 (tumor_excl,  (0.86, 0.12, 0.12, 0.80), "Tumor exclusion zone"),
             ]
 
-            for ax, (panel_label, z) in zip(axes, slice_specs):
-                ct_slice = ct_hu[z].astype(float)
-                ct_norm = np.clip((ct_slice - hu_lo) / (hu_hi - hu_lo), 0.0, 1.0)
-                ax.imshow(ct_norm, cmap="gray", origin="upper", aspect="equal",
-                          interpolation="bilinear", vmin=0.0, vmax=1.0)
+            for r_idx, (orient_name, orient_axis, ax_letter, sp_mm) in enumerate(orientations):
+                for c_idx, side_label in enumerate(side_labels):
+                    ax = axes[r_idx, c_idx]
+                    z_c, y_c, x_c = side_centroids[side_label]
+                    # Pick the index appropriate for this orientation
+                    slice_idx = (z_c, y_c, x_c)[orient_axis]
 
-                for mask, rgba, lbl in layers:
-                    _overlay(ax, mask, z, rgba)
-                    if mask is not None and mask[z].any():
-                        _add_legend(rgba, lbl)
+                    ct_sl = _get_ct_slice(orient_axis, slice_idx)
+                    ct_norm = np.clip((ct_sl - hu_lo) / (hu_hi - hu_lo), 0.0, 1.0)
+                    ax.imshow(ct_norm, cmap="gray", origin="upper", aspect="equal",
+                              interpolation="bilinear", vmin=0.0, vmax=1.0)
 
-                spacing_zyx = getattr(self._app, "spacing_zyx", (1.0, 1.0, 1.0))
-                ax.set_title(
-                    f"{panel_label}  —  axial slice z={z}\n"
-                    f"(z-spacing {float(spacing_zyx[0]):.2f} mm)",
-                    fontsize=9, fontweight="bold", color="#1a1a2e"
-                )
-                ax.axis("off")
+                    for mask, rgba, lbl in layers:
+                        sl_2d = _get_mask_slice(mask, orient_axis, slice_idx)
+                        _overlay_2d(ax, sl_2d, rgba)
+                        if sl_2d is not None and sl_2d.any():
+                            _add_legend(rgba, lbl)
 
-            # Shared legend
+                    ax.set_title(
+                        f"{side_label}  —  {orient_name}  "
+                        f"{ax_letter}={slice_idx}\n"
+                        f"({ax_letter}-spacing {sp_mm:.2f} mm)",
+                        fontsize=9, fontweight="bold", color="#1a1a2e",
+                    )
+                    ax.axis("off")
+
+            # Shared legend at the bottom
             if legend_handles:
                 fig.legend(
                     handles=legend_handles,
@@ -7041,11 +7105,12 @@ class V21BreastDensityTab(QtWidgets.QWidget):
                     fontsize=8,
                     framealpha=0.9,
                     edgecolor="#aaaaaa",
-                    bbox_to_anchor=(0.5, -0.04),
+                    bbox_to_anchor=(0.5, 0.0),
                 )
 
-            fig.suptitle("Breast CT Segmentation — Tissue Layers", fontsize=12,
-                         fontweight="bold", y=1.01, color="#1a1a2e")
+            fig.suptitle("Breast CT Segmentation — Tissue Layers\n"
+                         "(rows: Axial · Coronal · Sagittal)",
+                         fontsize=12, fontweight="bold", y=1.01, color="#1a1a2e")
             fig.tight_layout(rect=[0, 0.06, 1, 1])
 
             ext = path.rsplit(".", 1)[-1].lower() if "." in path else "png"
@@ -7057,7 +7122,7 @@ class V21BreastDensityTab(QtWidgets.QWidget):
             QtWidgets.QMessageBox.information(
                 self, "Export Figure",
                 f"Segmentation figure saved:\n{path}\n\n"
-                f"Panels: {', '.join(lbl for lbl, _ in slice_specs)}"
+                f"Views: {', '.join(side_labels)}  ×  Axial / Coronal / Sagittal"
             )
         except Exception as exc:
             self._log_msg(f"[Figure] ERROR: {exc}")
