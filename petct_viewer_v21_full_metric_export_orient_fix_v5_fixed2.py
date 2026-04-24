@@ -4952,18 +4952,25 @@ def _bd_detect_thorax_z_range(ct_volume: np.ndarray) -> tuple:
     """Estimate the Z-slice range covering the thorax (chest), excluding abdomen.
 
     Strategy:
-    1. Find the body outline by thresholding air (HU < -500).
-    2. Detect the diaphragm as the inferior boundary of the lung fields using the
-       per-slice fraction of lung-equivalent voxels (HU -950 to -200).
-       The diaphragm is where the lung fraction drops sharply.
-    3. Return (z_top, z_diaphragm) so the caller can crop to thorax slices only.
-
-    Falls back to the top half of the volume if detection is unreliable.
+    1. Compute the per-slice fraction of lung-equivalent voxels (HU -950 to -200).
+    2. Use a *self-calibrating* threshold (max(0.05, peak_frac * 0.20)) so that
+       scattered bowel/stomach gas — which typically occupies only 1–5 % of
+       abdominal pixels — is rejected.  Real lung parenchyma routinely fills
+       15–40 % of thoracic slice pixels.
+    3. Find the superior lung border (z_top) and locate the diaphragm by
+       detecting the first sustained drop in the lung-fraction signal: the
+       last slice whose *smoothed* value still exceeds the threshold AND whose
+       *raw* value 3 slices later has already fallen below a low-noise floor
+       (0.02).  This prevents bowel gas below the diaphragm from pushing
+       z_diaphragm into the abdomen.
+    4. Apply a hard safety cap: z_diaphragm ≤ 75 % of the total slice count.
+    5. Return (z_top, z_diaphragm).  Falls back to top 50 % of volume if no
+       clear lung signal is found.
     """
     nz = ct_volume.shape[0]
     lung_hu_min, lung_hu_max = -950, -200
 
-    # Per-slice lung voxel fraction (lung is very low HU)
+    # Per-slice lung voxel fraction
     lung_frac = np.array([
         float(np.mean((ct_volume[z] >= lung_hu_min) & (ct_volume[z] <= lung_hu_max)))
         for z in range(nz)
@@ -4973,20 +4980,42 @@ def _bd_detect_thorax_z_range(ct_volume: np.ndarray) -> tuple:
     kernel = np.ones(5, dtype=np.float64) / 5.0
     lung_frac_smooth = np.convolve(lung_frac, kernel, mode="same")
 
-    # Find slices where lungs are present (threshold: >2% lung pixels in slice)
-    lung_present = lung_frac_smooth > 0.02
+    peak_frac = float(lung_frac_smooth.max())
+    if peak_frac < 0.05:
+        # No clear lung signal — fall back to top 50 % of volume
+        return 0, nz // 2
+
+    # Self-calibrating threshold: at least 5 % AND 20 % of the peak fraction.
+    # This rejects bowel/stomach gas which fills only 1–5 % of abdominal pixels.
+    threshold = max(0.05, peak_frac * 0.20)
+    lung_present = lung_frac_smooth >= threshold
     lung_z = np.where(lung_present)[0]
 
     if lung_z.size < 5:
-        # No clear lung signal — fall back to top 50% of volume
         return 0, nz // 2
 
     z_top = int(lung_z[0])
-    z_lung_end = int(lung_z[-1])  # last slice still showing lung (inferior)
+    z_lung_end = int(lung_z[-1])
 
-    # Diaphragm is approximately at z_lung_end (lung disappears below it).
-    # Add a small margin (5 slices) to capture the full inferior breast.
-    z_diaphragm = min(z_lung_end + 5, nz - 1)
+    # Diaphragm detection: walk backwards from z_lung_end to find where the
+    # lung signal *truly* disappears.  A 3-slice look-ahead in the raw (un-
+    # smoothed) signal must drop below 0.02 to confirm the lung has ended.
+    # This prevents a few gas-containing abdominal slices from dragging
+    # z_lung_end further inferior.
+    low_floor = 0.02
+    look_ahead = 3
+    for z in range(z_lung_end, z_top, -1):
+        # Check that the next look_ahead raw slices are all below the noise floor
+        future_end = min(z + look_ahead, nz - 1)
+        if np.all(lung_frac[z:future_end + 1] < low_floor):
+            z_lung_end = z
+            break
+
+    # Add a 2-slice inferior margin to capture the full inferior breast.
+    z_diaphragm = min(z_lung_end + 2, nz - 1)
+
+    # Hard cap: diaphragm cannot exceed 75 % of the total scan extent.
+    z_diaphragm = min(z_diaphragm, int(nz * 0.75))
 
     return z_top, z_diaphragm
 
