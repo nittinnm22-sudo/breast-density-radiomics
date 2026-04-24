@@ -4929,6 +4929,19 @@ def _bd_safe_div(numerator: float, denominator: float) -> float:
     return float(numerator / denominator) if denominator else 0.0
 
 
+def _bd_sanitize_features(feats: dict) -> dict:
+    """Replace any ``inf`` / ``-inf`` value in *feats* with ``float('nan')``.
+
+    Infinite values (most commonly from division-by-zero in texture matrices)
+    are invalid for statistical analysis and must not enter the final dataset.
+    """
+    return {
+        k: (float("nan") if (isinstance(v, float) and not (v != v) and not (-1e308 < v < 1e308))
+            else v)
+        for k, v in feats.items()
+    }
+
+
 def _bd_voxel_volume_cc(voxel_spacing_mm) -> float:
     return float(np.prod(voxel_spacing_mm) / 1000.0)
 
@@ -5673,8 +5686,9 @@ class GLCMFeatures(_BDTextureFeatureBase):
         joint_entropy = float(-np.sum(glcm * np.log2(glcm + 1e-12)))
         joint_energy = float(np.sum(glcm ** 2))
         homogeneity = float(np.sum(glcm / (1.0 + diff ** 2)))
-        # IDM (inverse difference moment)
-        idm = float(np.sum(glcm / (1.0 + diff)))
+        # IDM (inverse difference moment) — standard formula uses |i-j|, not signed diff,
+        # so the denominator is always >= 1 and never produces inf.
+        idm = float(np.sum(glcm / (1.0 + np.abs(diff))))
         cluster_shade = float(np.sum(glcm * ((i_idx + j_idx - mu_i - mu_j) ** 3)))
         cluster_prominence = float(np.sum(glcm * ((i_idx + j_idx - mu_i - mu_j) ** 4)))
         # sum/diff distributions
@@ -5941,15 +5955,45 @@ class ParenchymalComplexityEngine:
         self.parenchymal_mask = parenchymal_mask
         self.voxel_spacing_mm = voxel_spacing_mm
 
-    def compute_all(self) -> dict:
-        shape = ShapeFeatures().compute(self.parenchymal_mask, self.voxel_spacing_mm)
+    def compute_all(self, skip_shape: bool = False) -> dict:
+        """Compute all parenchymal complexity features.
+
+        Parameters
+        ----------
+        skip_shape:
+            When *True* all shape features (``sphericity``, ``elongation``,
+            ``flatness``, ``major_axis_length_mm``, ``max_3d_diameter_mm``,
+            etc.) are set to ``NaN``.  Use this for bilateral merged masks
+            where a disconnected two-sided object produces biologically
+            meaningless shape metrics (e.g. MajorAxisLength > 1000 mm
+            spanning both breasts).  Shape should only be extracted per
+            breast, not from a union mask.
+        """
+        if skip_shape:
+            # Compute volume (parenchymal_volume_cc) but nullify spatial shape.
+            vox_cc = _bd_voxel_volume_cc(self.voxel_spacing_mm)
+            vol_cc = round(float(np.count_nonzero(self.parenchymal_mask)) * vox_cc, 4)
+            shape = {
+                "parenchymal_volume_cc": vol_cc,
+                "volume_cc": vol_cc,
+                "surface_area_mm2": float("nan"),
+                "surface_to_volume_ratio": float("nan"),
+                "sphericity": float("nan"),
+                "elongation": float("nan"),
+                "flatness": float("nan"),
+                "major_axis_length_mm": float("nan"),
+                "minor_axis_length_mm": float("nan"),
+                "max_3d_diameter_mm": float("nan"),
+            }
+        else:
+            shape = ShapeFeatures().compute(self.parenchymal_mask, self.voxel_spacing_mm)
         first_order = FirstOrderFeatures().compute(self.ct_volume, self.parenchymal_mask)
         glcm = GLCMFeatures().compute(self.ct_volume, self.parenchymal_mask)
         glrlm = GLRLMFeatures().compute(self.ct_volume, self.parenchymal_mask)
         glszm = GLSZMFeatures().compute(self.ct_volume, self.parenchymal_mask)
         gldm = GLDMFeatures().compute(self.ct_volume, self.parenchymal_mask)
         ngtdm = NGTDMFeatures().compute(self.ct_volume, self.parenchymal_mask)
-        all_feats = {**shape, **first_order, **glcm, **glrlm, **glszm, **gldm, **ngtdm}
+        all_feats = _bd_sanitize_features({**shape, **first_order, **glcm, **glrlm, **glszm, **gldm, **ngtdm})
         shortlist = {k: all_feats.get(k, float("nan")) for k in _BD_MANUSCRIPT_SHORTLIST_FEATURES}
         return {**all_feats, "manuscript_shortlist": shortlist}
 
@@ -6673,9 +6717,14 @@ class V21BreastDensityTab(QtWidgets.QWidget):
 
         def _compute():
             engine = ParenchymalComplexityEngine(ct_snap, mask_snap, voxel_spacing_mm)
-            return {"complexity": engine.compute_all()}
+            # skip_shape=True: bilateral merged mask spans both breasts as a disconnected
+            # object — shape features (MajorAxisLength, sphericity, etc.) would be
+            # biologically meaningless (e.g. >1000 mm axis).  Shape must only be
+            # extracted per-breast via the individual side buttons.
+            return {"complexity": engine.compute_all(skip_shape=True)}
 
-        self._log_msg("[Complexity] Computing bilateral radiomics features …")
+        self._log_msg("[Complexity] Computing bilateral radiomics features "
+                      "(shape features suppressed — use per-breast buttons for shape) …")
         self._set_busy(True, "Computing bilateral radiomics … please wait")
         self._worker = _BreastWorker(_compute)
         self._worker.finished.connect(self._on_complexity_done)
