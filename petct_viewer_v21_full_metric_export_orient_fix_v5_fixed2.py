@@ -5041,6 +5041,65 @@ def _bd_get_body_outline(ct_volume: np.ndarray) -> np.ndarray:
     return body.astype(bool)
 
 
+def _bd_keep_largest_anterior_component(mask: np.ndarray, ny: int,
+                                         anterior_y_fraction: float = 0.65) -> np.ndarray:
+    """Return the largest connected component whose centroid lies in the
+    anterior (low-Y) portion of the volume.
+
+    After HU thresholding and Z/Y ROI filtering, residual liver, spleen, and
+    subdiaphragmatic soft-tissue fragments may still survive.  They are not
+    spatially connected to the anterior breast mound, so taking the largest
+    anteriorly-centred connected component reliably isolates the true breast
+    tissue for each side.
+
+    Parameters
+    ----------
+    mask:
+        Boolean 3-D candidate mask for one side (right or left).
+    ny:
+        Number of voxels in the Y (anterior–posterior) axis.
+    anterior_y_fraction:
+        Centroid Y must be below ``ny * anterior_y_fraction`` to be considered
+        an anterior (breast) structure.  Default 0.65 keeps the anterior 65 %
+        of AP depth, which safely includes the entire breast mound while
+        excluding posterior abdominal structures.
+
+    Returns
+    -------
+    Boolean 3-D array of the same shape as ``mask``.
+    """
+    if not mask.any():
+        return mask
+
+    labeled, n = _bd_ndi.label(mask)
+    if n == 0:
+        return mask
+
+    y_threshold = ny * anterior_y_fraction  # centroid Y must be below this
+
+    best_label = 0
+    best_size = 0
+
+    for lbl in range(1, n + 1):
+        comp = labeled == lbl
+        size = int(comp.sum())
+        if size == 0:
+            continue
+        zz, yy, xx = np.nonzero(comp)
+        centroid_y = float(yy.mean())
+        if centroid_y < y_threshold and size > best_size:
+            best_size = size
+            best_label = lbl
+
+    if best_label == 0:
+        # No anteriorly-centred component found — fall back to overall largest
+        sizes = np.bincount(labeled.ravel())
+        sizes[0] = 0
+        best_label = int(np.argmax(sizes))
+
+    return (labeled == best_label).astype(bool)
+
+
 # --- TotalSegmentator anatomy-constraint helpers ---
 
 # Structures used to locate the diaphragm (inferior boundary of lungs)
@@ -5188,6 +5247,10 @@ class BreastSegmentor:
        table and out-of-body noise.
     4. **Left/Right split**: the midline split is along the X-axis (columns)
        which corresponds to patient left/right in standard axial CT orientation.
+    5. **Largest anterior connected component**: after per-side splitting, only
+       the largest connected component whose centroid lies in the anterior 65 %
+       of AP depth is retained.  This discards liver, spleen, and any
+       subdiaphragmatic structures that are not contiguous with the breast mound.
     """
 
     # Fraction of the AP (Y) depth to keep as the anterior breast region.
@@ -5292,6 +5355,13 @@ class BreastSegmentor:
 
         right_mask = _bd_remove_small_objects(right_mask, min_size=1_000)
         left_mask = _bd_remove_small_objects(left_mask, min_size=1_000)
+
+        # Step 6 — keep only the largest anteriorly-centred connected component
+        # per side.  Liver, spleen, and subdiaphragmatic soft-tissue fragments
+        # that survive Z/Y/HU filtering are not spatially connected to the
+        # anterior breast mound, so this step eliminates them reliably.
+        right_mask = _bd_keep_largest_anterior_component(right_mask, ny)
+        left_mask = _bd_keep_largest_anterior_component(left_mask, ny)
 
         return {"right_mask": right_mask, "left_mask": left_mask}
 
