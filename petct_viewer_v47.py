@@ -5411,28 +5411,25 @@ class BreastSegmentor:
 
     def segment_fibroglandular(self, ct_volume: np.ndarray,
                                breast_mask: np.ndarray) -> np.ndarray:
-        """Two-stage fibroglandular segmentation with breast-local anatomical constraints.
+        """Stage A — permissive HU-based candidate detection inside the breast ROI.
 
-        Stage A — permissive HU-based candidate detection inside the whole-breast ROI.
-        Stage B — strict anatomical filtering via :py:meth:`exclude_non_parenchymal`
-                  (skin-distance constraint, breast-local pectoralis rejection,
-                   vessel/clip suppression, centrality check).
+        Returns raw fibroglandular candidates **before** anatomical filtering.
+        Callers must pass the result to :py:meth:`exclude_non_parenchymal` (Stage B)
+        to remove skin, pectoralis, clips and other non-parenchymal structures.
 
-        The breast_mask is passed through both stages so all exclusions are
-        derived from the breast's own geometry, not global CT coordinates.
+        HU range: (_BD_HU_FAT_MAX, 100] captures glandular/fibrous tissue while
+        excluding pure fat (<= _BD_HU_FAT_MAX) and muscle/vessels (> 100 HU).
         """
         if not breast_mask.any():
             return np.zeros_like(breast_mask, dtype=bool)
 
-        # ── Stage A: permissive candidate detection ──────────────────────────
-        fg = (ct_volume > _BD_HU_FAT_MAX) & breast_mask
+        # Permissive FG candidates: above fat threshold and below muscle/vessel
+        # threshold.  Capping at 100 HU prevents pectoralis muscle (typically
+        # 40–80 HU) from entering the candidate set en masse.
+        fg = (ct_volume > _BD_HU_FAT_MAX) & (ct_volume <= 100) & breast_mask
         fg = _bd_binary_opening(fg, footprint=np.ones((3, 3, 3)))
         fg = _bd_binary_closing(fg, footprint=np.ones((3, 3, 3)))
-        fg = _bd_remove_small_objects(fg, min_size=200)
-
-        # ── Stage B: strict breast-local anatomical filtering ─────────────────
-        fg = self.exclude_non_parenchymal(fg, ct_volume, breast_mask=breast_mask)
-        return fg
+        return _bd_remove_small_objects(fg, min_size=200)
 
     def exclude_non_parenchymal(self, fg_mask: np.ndarray, ct_volume: np.ndarray,
                                  breast_mask: np.ndarray = None) -> np.ndarray:
@@ -5446,13 +5443,15 @@ class BreastSegmentor:
         ------------------
         1. **Skin shell** — outer ``_FG_SKIN_EROSION_VOX`` voxels of the breast
            boundary.  Fibroglandular tissue is never present in cutaneous skin.
-        2. **Pectoralis / posterior chest wall** — posterior 25 % of the breast's
+        2. **Pectoralis / posterior chest wall** — posterior 40 % of the breast's
            own AP span and HU above the muscle threshold.  Uses breast-local Y
            geometry, not a global volume threshold.
         3. **Metal clips / calcifications** — small objects with HU > clip threshold.
-        4. **Blood vessels** — thin bright strands (HU 80–clip_min) after clip
-           removal.
-        5. **Minimum size** — connected components < 100 voxels are discarded.
+        4. **Minimum size** — connected components < 100 voxels are discarded.
+
+        Note: vessel exclusion by HU range is intentionally *not* applied here
+        because the 80–400 HU range overlaps with actual fibroglandular tissue.
+        Vessel masks for display are computed separately in compute_exclusion_masks.
         """
         cleaned = fg_mask.copy()
         if not cleaned.any():
@@ -5478,13 +5477,16 @@ class BreastSegmentor:
         cleaned &= ~skin_zone
 
         # ── 2. Pectoralis / posterior chest-wall exclusion (breast-local) ────
+        # Use posterior 40 % of the breast's own AP (Y) span.  This is more
+        # aggressive than the previous 25 % and reliably catches pectoralis
+        # muscle that sits at the posterior wall of the breast ROI.
         if ref_mask.any():
             y_coords = np.where(ref_mask.any(axis=(0, 2)))[0]
             if y_coords.size >= 2:
                 y_ant = int(y_coords.min())
                 y_post = int(y_coords.max())
-                # Posterior 25 % of the breast's own AP (Y) extent
-                y_pec_thresh = y_ant + max(1, int((y_post - y_ant) * 0.75))
+                # Pectoralis zone starts at 60 % of breast AP depth from anterior
+                y_pec_thresh = y_ant + max(1, int((y_post - y_ant) * 0.60))
             else:
                 y_pec_thresh = int(ct_volume.shape[1] * 0.50)
         else:
@@ -5504,12 +5506,7 @@ class BreastSegmentor:
             if small_ids.size:
                 cleaned &= ~np.isin(labels, small_ids)
 
-        # ── 4. Blood vessels: thin bright strands ────────────────────────────
-        vessels = (ct_volume >= 80) & (ct_volume <= _BD_HU_CLIP_MIN) & cleaned
-        vessels = _bd_remove_small_objects(vessels.astype(bool), min_size=20)
-        cleaned &= ~vessels
-
-        # ── 5. Minimum size ───────────────────────────────────────────────────
+        # ── 4. Minimum size ───────────────────────────────────────────────────
         return _bd_remove_small_objects(cleaned, min_size=100)
 
     def compute_fg_qc_warnings(self, fg_mask: np.ndarray, breast_mask: np.ndarray,
@@ -5547,12 +5544,12 @@ class BreastSegmentor:
                     "check breast ROI boundary and skin-exclusion depth."
                 )
 
-            # Posterior pectoralis zone
+            # Posterior pectoralis zone (matches exclude_non_parenchymal: 40% from rear)
             y_coords = np.where(breast_mask.any(axis=(0, 2)))[0]
             if y_coords.size >= 2:
                 y_ant = int(y_coords.min())
                 y_post = int(y_coords.max())
-                y_pec_thresh = y_ant + max(1, int((y_post - y_ant) * 0.75))
+                y_pec_thresh = y_ant + max(1, int((y_post - y_ant) * 0.60))
                 posterior_region = np.zeros(ct_volume.shape, dtype=bool)
                 posterior_region[:, y_pec_thresh:, :] = True
                 pec_zone = posterior_region & (ct_volume > _BD_HU_MUSCLE_MIN) & breast_mask
@@ -5580,17 +5577,15 @@ class BreastSegmentor:
         inner = _bd_ndi.binary_erosion(breast_mask, iterations=2)
         skin = breast_mask & ~inner
 
-        # Pectoralis: posterior 25 % of the breast's own AP (Y) extent, not
-        # the global 50 % of the CT volume.  Using the breast mask's Y span
-        # correctly restricts the pectoralis layer to the back of the breast
-        # mound and avoids labelling structures outside the breast ROI.
+        # Pectoralis: posterior 40 % of the breast's own AP (Y) extent — matches
+        # the threshold used in exclude_non_parenchymal for consistency.
         posterior_region = np.zeros(ct_volume.shape, dtype=bool)
         if breast_mask.any():
             y_coords = np.where(breast_mask.any(axis=(0, 2)))[0]
             if y_coords.size >= 2:
                 y_ant = int(y_coords.min())
                 y_post = int(y_coords.max())
-                y_pec_thresh = y_ant + max(1, int((y_post - y_ant) * 0.75))
+                y_pec_thresh = y_ant + max(1, int((y_post - y_ant) * 0.60))
             else:
                 y_pec_thresh = int(ct_volume.shape[1] * 0.50)
         else:
