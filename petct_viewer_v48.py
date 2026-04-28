@@ -741,7 +741,8 @@ class SliceView(QtWidgets.QWidget):
 
 # --- 3D Rotating MIP Player (fixed + sized to screen) ---
 class RotatingMIPPlayer(QtWidgets.QDialog):
-    def __init__(self, projections: List[np.ndarray], global_suv_stats: Dict[str, float], parent=None):
+    def __init__(self, projections: List[np.ndarray], global_suv_stats: Dict[str, float], parent=None,
+                 spacing_xz: tuple = (1.0, 1.0)):
         super().__init__(parent)
         self.setWindowTitle("3D Rotating MIP — Accurate SUV")
 
@@ -770,6 +771,11 @@ class RotatingMIPPlayer(QtWidgets.QDialog):
         self.vb = pg.ViewBox(); self.vb.setAspectLocked(True); self.vb.invertY(False)
         self.plot = self.glw.addPlot(viewBox=self.vb); self.plot.hideAxis('left'); self.plot.hideAxis('bottom')
         self.img_item = pg.ImageItem(axisOrder='row-major'); self.plot.addItem(self.img_item)
+        # Apply physical voxel spacing so craniocaudal (Z) vs transverse (X) proportions are correct.
+        # MIP frame axes: rows=Z, cols=X  →  scale x by spacing_x, y by spacing_z.
+        sx, sz = float(spacing_xz[0]), float(spacing_xz[1])
+        _t = QtGui.QTransform(); _t.scale(sx, sz)
+        self.img_item.setTransform(_t)
         layout.addWidget(self.glw)
 
         # Controls
@@ -1406,7 +1412,9 @@ class PETCTManualROIApp(QtWidgets.QMainWindow):
                             "p99": float(np.percentile(all_vals, 99)),
                             "p997": float(np.percentile(all_vals, 99.7))}
 
-            self.mip_player = RotatingMIPPlayer(projections, global_stats, self)
+            spacing_x = float(suv_img.GetSpacing()[0])  # mm/voxel transverse (X)
+            spacing_z = float(suv_img.GetSpacing()[2])  # mm/voxel craniocaudal (Z)
+            self.mip_player = RotatingMIPPlayer(projections, global_stats, self, spacing_xz=(spacing_x, spacing_z))
             self.mip_player.show()
             self._status("MIP ready.")
         except Exception as e:
