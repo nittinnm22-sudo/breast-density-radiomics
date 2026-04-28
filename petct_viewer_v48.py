@@ -768,14 +768,15 @@ class RotatingMIPPlayer(QtWidgets.QDialog):
 
         # View
         self.glw = pg.GraphicsLayoutWidget()
-        self.vb = pg.ViewBox(); self.vb.setAspectLocked(True); self.vb.invertY(False)
+        self.vb = pg.ViewBox(); self.vb.invertY(False)
         self.plot = self.glw.addPlot(viewBox=self.vb); self.plot.hideAxis('left'); self.plot.hideAxis('bottom')
         self.img_item = pg.ImageItem(axisOrder='row-major'); self.plot.addItem(self.img_item)
-        # Apply physical voxel spacing so craniocaudal (Z) vs transverse (X) proportions are correct.
-        # MIP frame axes: rows=Z, cols=X  →  scale x by spacing_x, y by spacing_z.
+        # Lock physical pixel aspect so craniocaudal (Z) vs transverse (X) proportions are correct.
+        # MIP frame: rows=Z (sz mm each), cols=X (sx mm each).
+        # ratio=sz/sx corrects for non-square voxels directly in the ViewBox, which is more
+        # reliable than setTransform (the latter is not always picked up by ViewBox auto-range).
         sx, sz = float(spacing_xz[0]), float(spacing_xz[1])
-        _t = QtGui.QTransform(); _t.scale(sx, sz)
-        self.img_item.setTransform(_t)
+        self.vb.setAspectLocked(True, ratio=sz / sx if sx > 0 else 1.0)
         layout.addWidget(self.glw)
 
         # Controls
